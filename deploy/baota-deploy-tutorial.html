@@ -1,0 +1,1635 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IFRS17 预测模型系统 — 宝塔面板部署视频教程</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --bg-card: #1a1d27;
+  --bg-code: #131620;
+  --bg-sidebar: #161822;
+  --text: #e4e6eb;
+  --text-dim: #9ca3af;
+  --text-bright: #f8fafc;
+  --accent: #6366f1;
+  --accent-hover: #818cf8;
+  --accent-dim: rgba(99,102,241,0.15);
+  --green: #22c55e;
+  --green-dim: rgba(34,197,94,0.15);
+  --yellow: #f59e0b;
+  --yellow-dim: rgba(245,158,11,0.15);
+  --red: #ef4444;
+  --red-dim: rgba(239,68,68,0.15);
+  --blue: #3b82f6;
+  --blue-dim: rgba(59,130,246,0.15);
+  --border: #2a2d3a;
+  --radius: 10px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.7;
+  overflow: hidden;
+  height: 100vh;
+}
+
+/* Layout */
+.app {
+  display: flex;
+  height: 100vh;
+}
+
+/* Sidebar */
+.sidebar {
+  width: 300px;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  overflow-y: auto;
+}
+
+.sidebar-header {
+  padding: 24px 20px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.sidebar-header h1 {
+  font-size: 16px;
+  color: var(--text-bright);
+  margin-bottom: 4px;
+}
+
+.sidebar-header p {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.progress-bar {
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  margin-top: 12px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--green));
+  width: 0%;
+  transition: width 0.4s ease;
+  border-radius: 2px;
+}
+
+.step-list {
+  flex: 1;
+  padding: 12px 0;
+}
+
+.step-item {
+  display: flex;
+  align-items: center;
+  padding: 12px 20px;
+  cursor: pointer;
+  transition: all 0.2s;
+  border-left: 3px solid transparent;
+  gap: 12px;
+}
+
+.step-item:hover {
+  background: rgba(99,102,241,0.08);
+}
+
+.step-item.active {
+  background: var(--accent-dim);
+  border-left-color: var(--accent);
+}
+
+.step-item.done .step-num {
+  background: var(--green);
+  color: #fff;
+}
+
+.step-num {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--border);
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 600;
+  flex-shrink: 0;
+  transition: all 0.2s;
+}
+
+.step-item.active .step-num {
+  background: var(--accent);
+  color: #fff;
+}
+
+.step-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.step-title {
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.step-item.active .step-title {
+  color: var(--text-bright);
+  font-weight: 600;
+}
+
+.step-desc {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Main content */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.content-header {
+  padding: 20px 32px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+}
+
+.content-header-left {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.phase-badge {
+  background: var(--accent-dim);
+  color: var(--accent-hover);
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.content-header h2 {
+  font-size: 20px;
+  color: var(--text-bright);
+}
+
+.nav-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+.nav-btn {
+  padding: 8px 20px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text);
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 13px;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.nav-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent-hover);
+}
+
+.nav-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.nav-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.nav-btn.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.content-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 32px;
+}
+
+.content-section {
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+/* Content elements */
+.intro-text {
+  font-size: 15px;
+  color: var(--text-dim);
+  margin-bottom: 24px;
+  line-height: 1.8;
+}
+
+h3 {
+  font-size: 17px;
+  color: var(--text-bright);
+  margin: 28px 0 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+h3 .icon {
+  font-size: 20px;
+}
+
+h4 {
+  font-size: 14px;
+  color: var(--accent-hover);
+  margin: 20px 0 8px;
+}
+
+p {
+  margin-bottom: 12px;
+  font-size: 14px;
+}
+
+/* Table */
+.table-wrap {
+  overflow-x: auto;
+  margin: 16px 0;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+th {
+  background: var(--bg-card);
+  color: var(--text-bright);
+  padding: 10px 16px;
+  text-align: left;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+td {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+
+tr:last-child td {
+  border-bottom: none;
+}
+
+tr:hover td {
+  background: rgba(99,102,241,0.05);
+}
+
+td code {
+  background: var(--bg-code);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--accent-hover);
+}
+
+/* Code block */
+.code-block {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin: 16px 0;
+  overflow: hidden;
+}
+
+.code-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  background: rgba(255,255,255,0.03);
+  border-bottom: 1px solid var(--border);
+}
+
+.code-lang {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.copy-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: 4px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  transition: all 0.2s;
+}
+
+.copy-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent-hover);
+}
+
+.copy-btn.copied {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.code-block pre {
+  padding: 16px;
+  overflow-x: auto;
+  font-family: 'Fira Code', 'Consolas', 'Monaco', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #c9d1d9;
+}
+
+.code-block .comment { color: #6a9955; }
+.code-block .keyword { color: #c678dd; }
+.code-block .string { color: #98c379; }
+.code-block .number { color: #d19a66; }
+
+/* Alert boxes */
+.alert {
+  padding: 16px 20px;
+  border-radius: var(--radius);
+  margin: 16px 0;
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  font-size: 14px;
+}
+
+.alert-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+.alert-content {
+  flex: 1;
+}
+
+.alert-title {
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.alert-warning {
+  background: var(--yellow-dim);
+  border: 1px solid rgba(245,158,11,0.3);
+}
+
+.alert-warning .alert-title { color: var(--yellow); }
+.alert-warning .alert-icon { color: var(--yellow); }
+
+.alert-danger {
+  background: var(--red-dim);
+  border: 1px solid rgba(239,68,68,0.3);
+}
+
+.alert-danger .alert-title { color: var(--red); }
+.alert-danger .alert-icon { color: var(--red); }
+
+.alert-info {
+  background: var(--blue-dim);
+  border: 1px solid rgba(59,130,246,0.3);
+}
+
+.alert-info .alert-title { color: var(--blue); }
+.alert-info .alert-icon { color: var(--blue); }
+
+.alert-success {
+  background: var(--green-dim);
+  border: 1px solid rgba(34,197,94,0.3);
+}
+
+.alert-success .alert-title { color: var(--green); }
+.alert-success .alert-icon { color: var(--green); }
+
+/* Checklist */
+.checklist {
+  margin: 16px 0;
+}
+
+.checklist-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.2s;
+}
+
+.checklist-item:hover {
+  color: var(--text-bright);
+}
+
+.checklist-box {
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--border);
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.2s;
+  font-size: 12px;
+  color: transparent;
+}
+
+.checklist-item.checked .checklist-box {
+  background: var(--green);
+  border-color: var(--green);
+  color: #fff;
+}
+
+.checklist-item.checked .checklist-text {
+  text-decoration: line-through;
+  color: var(--text-dim);
+}
+
+/* Flow diagram */
+.flow-diagram {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  margin: 24px 0;
+  flex-wrap: wrap;
+}
+
+.flow-node {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 20px;
+  text-align: center;
+  min-width: 120px;
+}
+
+.flow-node-icon {
+  font-size: 28px;
+  margin-bottom: 6px;
+}
+
+.flow-node-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-bright);
+}
+
+.flow-node-desc {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+
+.flow-arrow {
+  color: var(--accent);
+  font-size: 20px;
+  padding: 0 12px;
+}
+
+/* Troubleshooting */
+.trouble-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin: 12px 0;
+  overflow: hidden;
+}
+
+.trouble-header {
+  padding: 14px 20px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  transition: all 0.2s;
+}
+
+.trouble-header:hover {
+  background: rgba(99,102,241,0.05);
+}
+
+.trouble-q {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-bright);
+}
+
+.trouble-toggle {
+  color: var(--text-dim);
+  transition: transform 0.2s;
+  font-size: 12px;
+}
+
+.trouble-card.open .trouble-toggle {
+  transform: rotate(180deg);
+}
+
+.trouble-body {
+  max-height: 0;
+  overflow: hidden;
+  transition: max-height 0.3s ease;
+}
+
+.trouble-card.open .trouble-body {
+  max-height: 600px;
+}
+
+.trouble-content {
+  padding: 0 20px 16px;
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.8;
+}
+
+/* Badge */
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.badge-green { background: var(--green-dim); color: var(--green); }
+.badge-yellow { background: var(--yellow-dim); color: var(--yellow); }
+.badge-red { background: var(--red-dim); color: var(--red); }
+.badge-blue { background: var(--blue-dim); color: var(--blue); }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #3a3d4a; }
+
+/* Responsive */
+@media (max-width: 768px) {
+  .sidebar { width: 60px; }
+  .step-info { display: none; }
+  .sidebar-header h1, .sidebar-header p { display: none; }
+  .content-body { padding: 16px; }
+}
+
+/* Completion screen */
+.completion {
+  text-align: center;
+  padding: 40px 20px;
+}
+
+.completion-icon {
+  font-size: 64px;
+  margin-bottom: 16px;
+}
+
+.completion h2 {
+  color: var(--green);
+  margin-bottom: 8px;
+}
+
+.completion p {
+  color: var(--text-dim);
+  font-size: 15px;
+}
+
+/* Step transition animation */
+.content-section {
+  animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <h1>IFRS17 宝塔部署教程</h1>
+      <p>Django 6.0 + Gunicorn + Nginx</p>
+      <div class="progress-bar">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+    </div>
+    <div class="step-list" id="stepList">
+      <!-- Steps will be generated by JS -->
+    </div>
+  </div>
+
+  <!-- Main -->
+  <div class="main">
+    <div class="content-header">
+      <div class="content-header-left">
+        <span class="phase-badge" id="phaseBadge">第 1 阶段</span>
+        <h2 id="stepTitle">准备工作</h2>
+      </div>
+      <div class="nav-buttons">
+        <button class="nav-btn" id="prevBtn" onclick="navigate(-1)">← 上一步</button>
+        <button class="nav-btn primary" id="nextBtn" onclick="navigate(1)">下一步 →</button>
+      </div>
+    </div>
+    <div class="content-body" id="contentBody">
+      <!-- Content will be generated by JS -->
+    </div>
+  </div>
+</div>
+
+<script>
+const steps = [
+  {
+    title: '准备工作',
+    desc: '阿里云ECS + 安全组',
+    content: `
+      <div class="content-section">
+        <p class="intro-text">在开始部署之前，需要先准备一台阿里云 ECS 服务器，并开放必要的网络端口。这是整个部署流程的基础。</p>
+
+        <h3><span class="icon">📋</span> 推荐服务器配置</h3>
+        <div class="table-wrap">
+          <table>
+            <tr><th>配置项</th><th>推荐值</th><th>说明</th></tr>
+            <tr><td>地域</td><td>华东1（杭州）</td><td>或离用户最近的地域</td></tr>
+            <tr><td>实例规格</td><td>2 vCPU / 4 GB</td><td>ecs.c7.large 或同等</td></tr>
+            <tr><td>操作系统</td><td><code>Ubuntu 22.04</code></td><td>推荐，宝塔兼容性最好</td></tr>
+            <tr><td>系统盘</td><td>40 GB 高效云盘</td><td>足够运行 Django + SQLite</td></tr>
+            <tr><td>带宽</td><td>按量计费 5 Mbps</td><td>起步，后续可调整</td></tr>
+          </table>
+        </div>
+
+        <h3><span class="icon">🔐</span> 安全组端口放行</h3>
+        <p>阿里云 ECS 控制台 → 安全组 → 入方向 → 添加规则：</p>
+        <div class="table-wrap">
+          <table>
+            <tr><th>端口</th><th>协议</th><th>源地址</th><th>用途</th></tr>
+            <tr><td><code>22</code></td><td>TCP</td><td>0.0.0.0/0</td><td>SSH 远程连接</td></tr>
+            <tr><td><code>80</code></td><td>TCP</td><td>0.0.0.0/0</td><td>HTTP 网站访问</td></tr>
+            <tr><td><code>443</code></td><td>TCP</td><td>0.0.0.0/0</td><td>HTTPS（配置SSL后）</td></tr>
+            <tr><td><code>8888</code></td><td>TCP</td><td>0.0.0.0/0</td><td>宝塔面板入口</td></tr>
+          </table>
+        </div>
+
+        <div class="alert alert-warning">
+          <span class="alert-icon">⚠️</span>
+          <div class="alert-content">
+            <div class="alert-title">安全提醒</div>
+            部署完成后，建议将 8888 端口源地址改为你的办公 IP 白名单，避免面板被暴力破解。
+          </div>
+        </div>
+
+        <h3><span class="icon">🏗️</span> 部署架构总览</h3>
+        <div class="flow-diagram">
+          <div class="flow-node">
+            <div class="flow-node-icon">🌐</div>
+            <div class="flow-node-title">浏览器</div>
+            <div class="flow-node-desc">用户访问 :80</div>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-node">
+            <div class="flow-node-icon">⚡</div>
+            <div class="flow-node-title">Nginx</div>
+            <div class="flow-node-desc">反向代理 + 静态文件</div>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-node">
+            <div class="flow-node-icon">🐍</div>
+            <div class="flow-node-title">Gunicorn</div>
+            <div class="flow-node-desc">:8000 WSGI</div>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-node">
+            <div class="flow-node-icon">📊</div>
+            <div class="flow-node-title">Django</div>
+            <div class="flow-node-desc">IFRS17 应用</div>
+          </div>
+        </div>
+
+        <div class="checklist">
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">已购买阿里云 ECS 实例</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">已配置安全组放行 22/80/443/8888 端口</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">已记录服务器公网 IP 地址</span>
+          </div>
+        </div>
+      </div>
+    `
+  },
+  {
+    title: '安装宝塔面板',
+    desc: 'SSH一键安装 + 首次登录',
+    content: `
+      <div class="content-section">
+        <p class="intro-text">通过 SSH 连接到服务器，执行宝塔面板一键安装脚本。安装过程约 3~5 分钟。</p>
+
+        <h3><span class="icon">🔗</span> SSH 登录服务器</h3>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">Bash</span>
+            <button class="copy-btn" onclick="copyCode(this)">复制</button>
+          </div>
+          <pre>ssh root@<span style="color:#d19a66">你的公网IP</span></pre>
+        </div>
+
+        <h3><span class="icon">📦</span> 一键安装宝塔面板</h3>
+        <h4>Ubuntu 22.04（推荐）</h4>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">Bash</span>
+            <button class="copy-btn" onclick="copyCode(this)">复制</button>
+          </div>
+          <pre>wget -O install.sh https://download.bt.cn/install/install-ubuntu_6.0.sh && sudo bash install.sh ed8484bec</pre>
+        </div>
+
+        <h4>CentOS 7/8</h4>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">Bash</span>
+            <button class="copy-btn" onclick="copyCode(this)">复制</button>
+          </div>
+          <pre>yum install -y wget && wget -O install.sh https://download.bt.cn/install/install_6.0.sh && sh install.sh ed8484bec</pre>
+        </div>
+
+        <h3><span class="icon">✅</span> 安装完成后</h3>
+        <p>终端会显示面板登录信息，<strong>务必保存</strong>：</p>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">Output</span>
+            <button class="copy-btn" onclick="copyCode(this)">复制</button>
+          </div>
+          <pre><span style="color:#6a9955">==================================================================</span>
+外网面板地址: http://203.0.113.1:8888/abc12345
+内网面板地址: http://10.0.0.1:8888/abc12345
+username: abcdefgh
+password: xxxxxxxxx
+<span style="color:#6a9955">==================================================================</span></pre>
+        </div>
+
+        <div class="alert alert-info">
+          <span class="alert-icon">💡</span>
+          <div class="alert-content">
+            <div class="alert-title">忘记密码？</div>
+            SSH 执行 <code>bt default</code> 即可重新查看面板登录信息。
+          </div>
+        </div>
+
+        <h3><span class="icon">🖥️</span> 首次登录设置</h3>
+        <p>浏览器打开 <code>http://公网IP:8888/安全入口</code>，登录后：</p>
+        <div class="checklist">
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">绑定宝塔账号（支持微信扫码）</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">修改面板端口（不要用默认 8888）</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">开启二次验证</span>
+          </div>
+        </div>
+      </div>
+    `
+  },
+  {
+    title: '安装运行环境',
+    desc: 'Nginx + Python项目管理器',
+    content: `
+      <div class="content-section">
+        <p class="intro-text">登录宝塔后，需要安装 Nginx 作为反向代理，以及 Python 项目管理器来管理 Django 应用。</p>
+
+        <h3><span class="icon">⚙️</span> 安装推荐套件</h3>
+        <p>首次登录会弹出「推荐安装套件」弹窗：</p>
+        <div class="table-wrap">
+          <table>
+            <tr><th>组件</th><th>是否安装</th><th>说明</th></tr>
+            <tr><td><strong>Nginx 1.24+</strong></td><td><span class="badge badge-green">必装</span></td><td>反向代理 + 静态文件服务</td></tr>
+            <tr><td>Apache</td><td><span class="badge badge-red">不装</span></td><td>Django 用 Nginx 即可</td></tr>
+            <tr><td>MySQL 8.0</td><td><span class="badge badge-yellow">可选</span></td><td>本项目用 SQLite，暂不需要</td></tr>
+            <tr><td>PHP</td><td><span class="badge badge-red">不装</span></td><td>Django 是 Python 框架</td></tr>
+            <tr><td>Redis</td><td><span class="badge badge-red">不装</span></td><td>本项目暂不需要缓存</td></tr>
+          </table>
+        </div>
+        <p>点击「极速安装」，等待 5~10 分钟完成。</p>
+
+        <h3><span class="icon">🐍</span> 安装 Python 项目管理器</h3>
+        <p>宝塔 11.8 的核心组件，用于管理 Python Web 项目：</p>
+        <div class="checklist">
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">左侧菜单 → 软件商店</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">搜索「Python项目管理器」</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">点击安装</span>
+          </div>
+        </div>
+
+        <h3><span class="icon">📂</span> 安装 Python 3.13</h3>
+        <p>安装完插件后，进入 Python 项目管理器 → 顶部「版本管理」标签：</p>
+        <div class="checklist">
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">点击「安装」，选择 Python 3.13</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">等待编译安装完成（约3分钟）</span>
+          </div>
+        </div>
+
+        <div class="alert alert-info">
+          <span class="alert-icon">📌</span>
+          <div class="alert-content">
+            <div class="alert-title">宝塔 11.8 新特性</div>
+            • Python 版本云端解析安装，无需手动编译<br>
+            • 智能依赖分析，上传 requirements.txt 自动检测版本冲突<br>
+            • 一键性能调优，根据 CPU 核数自动生成 Gunicorn 参数<br>
+            • 独立虚拟环境，项目之间互不污染
+          </div>
+        </div>
+      </div>
+    `
+  },
+  {
+    title: '上传项目代码',
+    desc: '打包 + 上传 + 解压',
+    content: `
+      <div class="content-section">
+        <p class="intro-text">将本地项目代码打包后上传到服务器。有两种方式可选。</p>
+
+        <h3><span class="icon">🗜️</span> 本地打包项目</h3>
+        <p>在 Windows 本地 PowerShell 执行：</p>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">PowerShell</span>
+            <button class="copy-btn" onclick="copyCode(this)">复制</button>
+          </div>
+          <pre>cd D:\\IFRS17预测模型
+
+tar -czf ifrs17-system.tar.gz \\
+  --exclude='__pycache__' \\
+  --exclude='*.sqlite3' \\
+  --exclude='.workbuddy' \\
+  --exclude='.playwright-cli' \\
+  ifrs17-system/</pre>
+        </div>
+
+        <h3><span class="icon">📤</span> 方式一：宝塔文件管理器（推荐）</h3>
+        <div class="checklist">
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">宝塔左侧 → 文件 → 导航到 /www/wwwroot/</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">新建文件夹 ifrs17-system</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">双击进入目录 → 点击上传按钮</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">选择 ifrs17-system.tar.gz 上传</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">右键 tar.gz → 解压到当前目录</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">删除 tar.gz 文件</span>
+          </div>
+        </div>
+
+        <h3><span class="icon">📤</span> 方式二：SCP 直传</h3>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">Bash</span>
+            <button class="copy-btn" onclick="copyCode(this)">复制</button>
+          </div>
+          <pre><span style="color:#6a9955"># 本地终端执行</span>
+scp "D:\\IFRS17预测模型\\ifrs17-system.tar.gz" root@<span style="color:#d19a66">公网IP</span>:/www/wwwroot/
+
+<span style="color:#6a9955"># SSH 登录后解压</span>
+ssh root@<span style="color:#d19a66">公网IP</span>
+cd /www/wwwroot && mkdir -p ifrs17-system
+tar -xzf ifrs17-system.tar.gz --strip-components=1 -C ifrs17-system/
+rm ifrs17-system.tar.gz</pre>
+        </div>
+
+        <h3><span class="icon">📁</span> 确认项目结构</h3>
+        <p>解压后，/www/wwwroot/ifrs17-system/ 目录应包含：</p>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">目录结构</span>
+            <button class="copy-btn" onclick="copyCode(this)">复制</button>
+          </div>
+          <pre>/www/wwwroot/ifrs17-system/
+├── manage.py                  <span style="color:#6a9955"># Django 入口</span>
+├── requirements.txt           <span style="color:#6a9955"># Python 依赖</span>
+├── gunicorn_config_baota.py   <span style="color:#6a9955"># Gunicorn 宝塔适配配置</span>
+├── data_fixtures/             <span style="color:#6a9955"># 初始数据</span>
+├── data_input/                <span style="color:#6a9955"># 核心应用</span>
+├── ifrs17_core/               <span style="color:#6a9955"># Django 配置</span>
+│   ├── settings.py            <span style="color:#6a9955"># 开发配置</span>
+│   ├── settings_prod.py       <span style="color:#6a9955"># 生产配置</span>
+│   └── wsgi.py                <span style="color:#6a9955"># WSGI 入口</span>
+├── static/                    <span style="color:#6a9955"># 前端资源</span>
+└── templates/                 <span style="color:#6a9955"># HTML 模板</span></pre>
+        </div>
+      </div>
+    `
+  },
+  {
+    title: 'Python 项目部署',
+    desc: '创建项目 + 依赖 + 数据库',
+    content: `
+      <div class="content-section">
+        <p class="intro-text">在宝塔 Python 项目管理器中创建项目，安装依赖，初始化数据库并收集静态文件。</p>
+
+        <h3><span class="icon">🐍</span> 5.1 创建 Python 项目</h3>
+        <p>软件商店 → 已安装 → Python项目管理器 → 设置 → 项目管理 → 添加项目</p>
+        <div class="table-wrap">
+          <table>
+            <tr><th>字段</th><th>填写内容</th><th>说明</th></tr>
+            <tr><td>项目名称</td><td><code>ifrs17</code></td><td>不含特殊字符</td></tr>
+            <tr><td>项目路径</td><td><code>/www/wwwroot/ifrs17-system</code></td><td>点右侧选择</td></tr>
+            <tr><td>运行用户</td><td><code>www</code></td><td>不要用 root</td></tr>
+            <tr><td>Python版本</td><td><code>Python 3.13</code></td><td>下拉选择</td></tr>
+            <tr><td>框架</td><td><code>Django</code></td><td>下拉选择</td></tr>
+            <tr><td>启动方式</td><td><code>gunicorn</code></td><td>下拉选择</td></tr>
+            <tr><td>启动文件</td><td><code>ifrs17_core.wsgi:application</code></td><td>WSGI 入口</td></tr>
+            <tr><td>端口</td><td><code>8000</code></td><td>Gunicorn 监听端口</td></tr>
+            <tr><td>开机启动</td><td><span class="badge badge-green">勾选</span></td><td>重启自动启动</td></tr>
+          </table>
+        </div>
+
+        <div class="alert alert-danger">
+          <span class="alert-icon">⚠️</span>
+          <div class="alert-content">
+            <div class="alert-title">端口一致性关键</div>
+            项目端口设为 <code>8000</code>，后续 Nginx 的 <code>proxy_pass</code> 也必须指向 <code>8000</code>。端口不一致是 502 错误的最常见原因。
+          </div>
+        </div>
+
+        <h3><span class="icon">📚</span> 5.2 安装 Python 依赖</h3>
+        <p>宝塔左侧 → 终端，执行：</p>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">Bash</span>
+            <button class="copy-btn" onclick="copyCode(this)">复制</button>
+          </div>
+          <pre><span style="color:#6a9955"># 进入项目目录</span>
+cd /www/wwwroot/ifrs17-system
+
+<span style="color:#6a9955"># 创建虚拟环境（如果面板没自动创建）</span>
+python3.13 -m venv venv
+
+<span style="color:#6a9955"># 激活虚拟环境</span>
+source venv/bin/activate
+
+<span style="color:#6a9955"># 升级 pip</span>
+pip install --upgrade pip
+
+<span style="color:#6a9955"># 安装依赖（使用国内镜像加速）</span>
+pip install -r requirements.txt -i https://mirrors.tencent.com/pypi/simple/
+
+<span style="color:#6a9955"># 验证</span>
+python -c "import django; print('Django', django.VERSION)"</pre>
+        </div>
+        <p>依赖文件内容（仅3个包）：</p>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">requirements.txt</span>
+            <button class="copy-btn" onclick="copyCode(this)">复制</button>
+          </div>
+          <pre>Django==6.0.6
+openpyxl==3.1.5
+gunicorn==23.0.0</pre>
+        </div>
+
+        <h3><span class="icon">🔑</span> 5.3 生成生产密钥</h3>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">Bash</span>
+            <button class="copy-btn" onclick="copyCode(this)">复制</button>
+          </div>
+          <pre>cd /www/wwwroot/ifrs17-system
+source venv/bin/activate
+
+python -c "
+import secrets
+key = secrets.token_urlsafe(50)
+with open('ifrs17_core/settings_prod.py', 'r') as f:
+    content = f.read()
+content = content.replace('your-production-secret-key-here', key)
+with open('ifrs17_core/settings_prod.py', 'w') as f:
+    f.write(content)
+print('SECRET_KEY 已更新')
+"</pre>
+        </div>
+
+        <h3><span class="icon">🗄️</span> 5.4 初始化数据库</h3>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">Bash</span>
+            <button class="copy-btn" onclick="copyCode(this)">复制</button>
+          </div>
+          <pre>cd /www/wwwroot/ifrs17-system
+source venv/bin/activate
+
+<span style="color:#6a9955"># 1. 执行数据库迁移</span>
+python manage.py migrate
+
+<span style="color:#6a9955"># 2. 收集静态文件</span>
+python manage.py collectstatic --noinput
+
+<span style="color:#6a9955"># 3. 加载初始数据（如有）</span>
+python manage.py init_data
+
+<span style="color:#6a9955"># 4. 创建超级用户</span>
+python manage.py createsuperuser
+<span style="color:#6a9955"># 用户名: admin  密码: 自行设置</span></pre>
+        </div>
+
+        <h3><span class="icon">🔒</span> 5.5 设置文件权限</h3>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">Bash</span>
+            <button class="copy-btn" onclick="copyCode(this)">复制</button>
+          </div>
+          <pre><span style="color:#6a9955"># 创建日志目录</span>
+mkdir -p /var/log/ifrs17 /var/run/ifrs17
+
+<span style="color:#6a9955"># 设置项目权限（宝塔 Nginx 使用 www 用户）</span>
+chown -R www:www /www/wwwroot/ifrs17-system/
+chmod -R 755 /www/wwwroot/ifrs17-system/
+chmod 664 /www/wwwroot/ifrs17-system/db.sqlite3
+
+<span style="color:#6a9955"># 日志目录权限</span>
+chown -R www:www /var/log/ifrs17 /var/run/ifrs17
+chmod 755 /var/log/ifrs17 /var/run/ifrs17</pre>
+        </div>
+
+        <h3><span class="icon">🚀</span> 5.6 启动项目</h3>
+        <p>回到 Python 项目管理器 → 找到 ifrs17 → 点击「启动」，状态应显示 🟢 运行中。</p>
+
+        <div class="alert alert-info">
+          <span class="alert-icon">💡</span>
+          <div class="alert-content">
+            <div class="alert-title">验证启动成功</div>
+            终端执行 <code>curl http://127.0.0.1:8000/</code>，如果返回 HTML 内容则说明 Gunicorn 已正常工作。
+          </div>
+        </div>
+      </div>
+    `
+  },
+  {
+    title: 'Nginx 反向代理',
+    desc: '创建网站 + 配置代理',
+    content: `
+      <div class="content-section">
+        <p class="intro-text">配置 Nginx 反向代理，将 80 端口的请求转发到 Gunicorn 的 8000 端口，并处理静态文件服务。</p>
+
+        <h3><span class="icon">🌐</span> 6.1 创建网站</h3>
+        <div class="checklist">
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">宝塔左侧 → 网站 → 添加站点</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">域名填写你的公网 IP 或域名</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">根目录选择 /www/wwwroot/ifrs17-system</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">PHP版本选「纯静态」</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">不创建 FTP 和数据库</span>
+          </div>
+        </div>
+
+        <h3><span class="icon">🔄</span> 6.2 配置反向代理</h3>
+        <p>网站列表 → 点击站点名称 → 反向代理 → 添加反向代理：</p>
+        <div class="table-wrap">
+          <table>
+            <tr><th>字段</th><th>值</th></tr>
+            <tr><td>代理名称</td><td><code>ifrs17_backend</code></td></tr>
+            <tr><td>目标URL</td><td><code>http://127.0.0.1:8000</code></td></tr>
+            <tr><td>发送域名</td><td><code>$host</code></td></tr>
+          </table>
+        </div>
+
+        <h3><span class="icon">📝</span> 6.3 修改 Nginx 配置文件</h3>
+        <p>站点设置 → 「配置文件」标签，用以下内容替换（注意保留宝塔标记段）：</p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">Nginx</span>
+            <button class="copy-btn" onclick="copyCode(this)">复制</button>
+          </div>
+          <pre>server {
+    listen 80;
+    server_name <span style="color:#d19a66">你的域名或IP</span>;
+    root /www/wwwroot/ifrs17-system;
+
+    <span style="color:#6a9955"># 保留宝塔自动生成的标记段...</span>
+
+    <span style="color:#6a9955"># ===== 静态文件（^~ 优先匹配）=====</span>
+    location ^~ /static/ {
+        alias /www/wwwroot/ifrs17-system/staticfiles/;
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
+    location ^~ /media/ {
+        alias /www/wwwroot/ifrs17-system/media/;
+        expires 7d;
+    }
+
+    <span style="color:#6a9955"># ===== 反向代理 =====</span>
+    location / {
+        <span style="color:#6a9955"># 端口必须与 Gunicorn bind 一致</span>
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        <span style="color:#6a9955"># 上传超时设置</span>
+        proxy_connect_timeout 60s;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+
+        <span style="color:#6a9955"># 缓冲区设置</span>
+        proxy_buffer_size 128k;
+        proxy_buffers 4 256k;
+        proxy_busy_buffers_size 256k;
+    }
+
+    access_log /www/wwwlogs/ifrs17-system.log;
+    error_log /www/wwwlogs/ifrs17-system.error.log;
+}</pre>
+        </div>
+
+        <div class="alert alert-danger">
+          <span class="alert-icon">🔴</span>
+          <div class="alert-content">
+            <div class="alert-title">三个必查项</div>
+            1. <code>proxy_pass</code> 端口 = Gunicorn <code>bind</code> 端口（必须都是 8000）<br>
+            2. 静态文件用 <code>^~</code> 前缀，否则被敏感文件规则拦截<br>
+            3. 必须先执行 <code>python manage.py collectstatic</code> 生成 staticfiles 目录
+          </div>
+        </div>
+
+        <h3><span class="icon">✅</span> 6.4 保存并重载</h3>
+        <p>保存配置后，点击页面顶部「重载配置」使 Nginx 生效。</p>
+      </div>
+    `
+  },
+  {
+    title: '域名与 SSL',
+    desc: 'DNS解析 + HTTPS证书',
+    content: `
+      <div class="content-section">
+        <p class="intro-text">如果使用域名访问，需要配置 DNS 解析和 SSL 证书。如果暂时用 IP 测试，可跳过本步。</p>
+
+        <h3><span class="icon">🌍</span> 方式一：使用真实域名</h3>
+        <div class="checklist">
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">购买/注册一个真实域名</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">域名服务商后台添加 A 记录 → 服务器公网 IP</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">等待 DNS 生效（5~30 分钟）</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">宝塔域名管理中替换为真实域名</span>
+          </div>
+        </div>
+
+        <h3><span class="icon">💻</span> 方式二：本地 hosts 测试</h3>
+        <p>修改本地电脑的 hosts 文件（仅本机有效）：</p>
+        <div class="table-wrap">
+          <table>
+            <tr><th>系统</th><th>文件路径</th></tr>
+            <tr><td>Windows</td><td><code>C:\\Windows\\System32\\drivers\\etc\\hosts</code></td></tr>
+            <tr><td>Linux/Mac</td><td><code>/etc/hosts</code></td></tr>
+          </table>
+        </div>
+        <p>添加一行：</p>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">Hosts</span>
+            <button class="copy-btn" onclick="copyCode(this)">复制</button>
+          </div>
+          <pre><span style="color:#d19a66">你的服务器公网IP</span>  ifrs17_backend.com</pre>
+        </div>
+
+        <h3><span class="icon">🔒</span> SSL 证书申请（需域名）</h3>
+        <div class="checklist">
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">站点设置 → SSL → Let's Encrypt</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">勾选域名 → 点击「申请」</span>
+          </div>
+          <div class="checklist-item" onclick="toggleCheck(this)">
+            <div class="checklist-box">✓</div>
+            <span class="checklist-text">申请成功后开启「强制HTTPS」</span>
+          </div>
+        </div>
+
+        <div class="alert alert-warning">
+          <span class="alert-icon">⚠️</span>
+          <div class="alert-content">
+            <div class="alert-title">HTTP 下 Cookie 问题</div>
+            如果暂时没有 SSL 证书（HTTP 模式），确保 <code>settings_prod.py</code> 中 <code>SESSION_COOKIE_SECURE = False</code>，否则浏览器不会保存登录 Cookie，导致登录后刷新就退出。
+          </div>
+        </div>
+      </div>
+    `
+  },
+  {
+    title: '验证与故障排查',
+    desc: '测试 + 常见问题解决',
+    content: `
+      <div class="content-section">
+        <p class="intro-text">部署完成后进行系统验证，并了解常见故障的排查方法。</p>
+
+        <h3><span class="icon=">✅</span> 部署验证清单</h3>
+        <div class="table-wrap">
+          <table>
+            <tr><th>检查项</th><th>操作</th><th>预期结果</th></tr>
+            <tr><td>Gunicorn 运行</td><td>Python项目管理器 → ifrs17</td><td>🟢 运行中</td></tr>
+            <tr><td>Nginx 运行</td><td>软件商店 → Nginx</td><td>🟢 运行中</td></tr>
+            <tr><td>登录页面</td><td>访问 <code>http://IP/login/</code></td><td>显示登录表单</td></tr>
+            <tr><td>用户登录</td><td>admin / 密码</td><td>跳转到主页</td></tr>
+            <tr><td>静态文件</td><td>页面有样式和交互</td><td>无 404 报错</td></tr>
+            <tr><td>上传功能</td><td>上传 Excel 文件</td><td>返回校验结果</td></tr>
+          </table>
+        </div>
+
+        <h3><span class="icon">🔧</span> 常见故障排查</h3>
+
+        <div class="trouble-card">
+          <div class="trouble-header" onclick="toggleTrouble(this)">
+            <div class="trouble-q"><span class="badge badge-red">502</span> Bad Gateway</div>
+            <span class="trouble-toggle">▼</span>
+          </div>
+          <div class="trouble-body">
+            <div class="trouble-content">
+              <strong>原因：</strong>Nginx 的 <code>proxy_pass</code> 端口与 Gunicorn 的 <code>bind</code> 端口不一致。<br><br>
+              <strong>排查：</strong><br>
+              1. 检查 <code>gunicorn_config_baota.py</code> 中 <code>bind = "127.0.0.1:8000"</code><br>
+              2. 检查 Nginx 配置中 <code>proxy_pass http://127.0.0.1:8000</code><br>
+              3. 两个端口必须完全一致<br>
+              4. SSH 执行 <code>ss -tlnp | grep 8000</code> 确认 Gunicorn 在监听
+            </div>
+          </div>
+        </div>
+
+        <div class="trouble-card">
+          <div class="trouble-header" onclick="toggleTrouble(this)">
+            <div class="trouble-q"><span class="badge badge-red">DNS</span> PROBE_FINISHED_NXDOMAIN</div>
+            <span class="trouble-toggle">▼</span>
+          </div>
+          <div class="trouble-body">
+            <div class="trouble-content">
+              <strong>原因：</strong>域名未在公网 DNS 中注册或未解析到服务器 IP。<br><br>
+              <strong>解决：</strong><br>
+              1. 使用真实域名并配置 A 记录指向服务器公网 IP<br>
+              2. 或直接用 IP 访问：<code>http://服务器IP/</code><br>
+              3. 本地测试可修改 hosts 文件
+            </div>
+          </div>
+        </div>
+
+        <div class="trouble-card">
+          <div class="trouble-header" onclick="toggleTrouble(this)">
+            <div class="trouble-q"><span class="badge badge-red">连接</span> ERR_CONNECTION_REFUSED (127.0.0.1)</div>
+            <span class="trouble-toggle">▼</span>
+          </div>
+          <div class="trouble-body">
+            <div class="trouble-content">
+              <strong>原因：</strong>浏览器在本地电脑上输入 <code>127.0.0.1:8080</code>，但项目部署在远程服务器上，本地没有程序监听该端口。<br><br>
+              <strong>解决：</strong>使用服务器公网 IP 访问，而不是 <code>127.0.0.1</code>。<code>127.0.0.1</code> 是本机回环地址，只在本机有效。
+            </div>
+          </div>
+        </div>
+
+        <div class="trouble-card">
+          <div class="trouble-header" onclick="toggleTrouble(this)">
+            <div class="trouble-q"><span class="badge badge-yellow">Nginx</span> "if" directive is not allowed here</div>
+            <span class="trouble-toggle">▼</span>
+          </div>
+          <div class="trouble-body">
+            <div class="trouble-content">
+              <strong>原因：</strong><code>if</code> 指令出现在了 <code>server{}</code> 或 <code>location{}</code> 块外部。<br><br>
+              <strong>排查：</strong>检查 <code>/www/server/panel/vhost/nginx/well-known/ifrs17-system.conf</code> 文件，第1行是否有 <code>if</code> 指令。<br><br>
+              <strong>解决：</strong>将该文件内容替换为：<br>
+              <pre style="background:#131620;padding:12px;border-radius:8px;color:#c9d1d9;font-size:12px">location ^~ /.well-known/acme-challenge/ {
+    allow all;
+    root /www/wwwroot/ifrs17-system;
+}</pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="trouble-card">
+          <div class="trouble-header" onclick="toggleTrouble(this)">
+            <div class="trouble-q"><span class="badge badge-yellow">Nginx</span> proxy_temp_file_write_size 约束错误</div>
+            <span class="trouble-toggle">▼</span>
+          </div>
+          <div class="trouble-body">
+            <div class="trouble-content">
+              <strong>原因：</strong><code>proxy_temp_file_write_size</code> 必须大于等于 <code>proxy_buffer_size</code> 和 <code>proxy_buffers</code> 单个缓冲区的最大值。<br><br>
+              <strong>规则：</strong><br>
+              <code>proxy_temp_file_write_size >= max(proxy_buffer_size, proxy_buffers中单个值)</code><br><br>
+              <strong>安全配置：</strong><br>
+              <pre style="background:#131620;padding:12px;border-radius:8px;color:#c9d1d9;font-size:12px">proxy_buffer_size 128k;
+proxy_buffers 4 256k;
+proxy_busy_buffers_size 256k;
+proxy_temp_file_write_size 256k;  <span style="color:#6a9955"># >= max(128k, 256k) = 256k</span></pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="trouble-card">
+          <div class="trouble-header" onclick="toggleTrouble(this)">
+            <div class="trouble-q"><span class="badge badge-yellow">404</span> 静态文件 CSS/JS 加载失败</div>
+            <span class="trouble-toggle">▼</span>
+          </div>
+          <div class="trouble-body">
+            <div class="trouble-content">
+              <strong>原因1：</strong>未执行 collectstatic<br>
+              <strong>解决：</strong><code>python manage.py collectstatic --noinput</code><br><br>
+              <strong>原因2：</strong>Nginx 静态文件 location 没用 <code>^~</code> 前缀<br>
+              <strong>解决：</strong>改为 <code>location ^~ /static/ { ... }</code><br><br>
+              <strong>原因3：</strong>alias 路径与 Django STATIC_ROOT 不一致<br>
+              <strong>解决：</strong>确认 alias 指向 <code>/www/wwwroot/ifrs17-system/staticfiles/</code>
+            </div>
+          </div>
+        </div>
+
+        <div class="trouble-card">
+          <div class="trouble-header" onclick="toggleTrouble(this)">
+            <div class="trouble-q"><span class="badge badge-yellow">登录</span> 登录后刷新就退出</div>
+            <span class="trouble-toggle">▼</span>
+          </div>
+          <div class="trouble-body">
+            <div class="trouble-content">
+              <strong>原因：</strong><code>SESSION_COOKIE_SECURE=True</code> 在 HTTP 下浏览器不保存 Cookie。<br><br>
+              <strong>解决：</strong>在 <code>settings_prod.py</code> 中确认：<br>
+              <pre style="background:#131620;padding:12px;border-radius:8px;color:#c9d1d9;font-size:12px">_USE_HTTPS = os.environ.get('IFRS17_USE_HTTPS', '0') == '1'
+SESSION_COOKIE_SECURE = _USE_HTTPS
+CSRF_COOKIE_SECURE = _USE_HTTPS</pre>
+              <span style="color:#6a9955"># HTTP 模式下 IFRS17_USE_HTTPS 默认为 '0'，Cookie 安全标志为 False</span>
+            </div>
+          </div>
+        </div>
+
+        <h3><span class="icon">📄</span> 日志查看命令</h3>
+        <div class="code-block">
+          <div class="code-header">
+            <span class="code-lang">Bash</span>
+            <button class="copy-btn" onclick="copyCode(this)">复制</button>
+          </div>
+          <pre><span style="color:#6a9955"># Gunicorn 日志</span>
+tail -100 /var/log/ifrs17/gunicorn_error.log
+tail -f /var/log/ifrs17/gunicorn_error.log    <span style="color:#6a9955"># 实时监控</span>
+
+<span style="color:#6a9955"># Nginx 日志</span>
+tail -100 /www/wwwlogs/ifrs17-system.error.log
+tail -f /www/wwwlogs/ifrs17-system.error.log  <span style="color:#6a9955"># 实时监控</span>
+
+<span style="color:#6a9955"># Nginx 配置测试</span>
+nginx -t
+nginx -s reload</pre>
+        </div>
+
+        <h3><span class="icon">🔄</span> 日常运维</h3>
+        <div class="table-wrap">
+          <table>
+            <tr><th>操作</th><th>方法</th></tr>
+            <tr><td>重启项目</td><td>Python项目管理器 → ifrs17 → 重启</td></tr>
+            <tr><td>更新代码后</td><td><code>python manage.py migrate && python manage.py collectstatic --noinput</code> → 重启</td></tr>
+            <tr><td>数据库备份</td><td>宝塔计划任务 → Shell 脚本定时复制 db.sqlite3</td></tr>
+            <tr><td>查看日志</td><td><code>tail -f /var/log/ifrs17/gunicorn_error.log</code></td></tr>
+          </table>
+        </div>
+
+        <div class="alert alert-success">
+          <span class="alert-icon">🎉</span>
+          <div class="alert-content">
+            <div class="alert-title">部署完成！</div>
+            如果以上验证全部通过，恭喜你！IFRS17 预测模型系统已成功部署到阿里云服务器。
+          </div>
+        </div>
+      </div>
+    `
+  }
+];
+
+let currentStep = 0;
+
+function renderSidebar() {
+  const list = document.getElementById('stepList');
+  list.innerHTML = steps.map((step, i) => `
+    <div class="step-item ${i === currentStep ? 'active' : ''}" onclick="goToStep(${i})">
+      <div class="step-num">${i + 1}</div>
+      <div class="step-info">
+        <div class="step-title">${step.title}</div>
+        <div class="step-desc">${step.desc}</div>
+      </div>
+    </div>
+  `).join('');
+  updateProgress();
+}
+
+function updateProgress() {
+  const progress = ((currentStep + 1) / steps.length) * 100;
+  document.getElementById('progressFill').style.width = progress + '%';
+  document.getElementById('phaseBadge').textContent = `第 ${currentStep + 1} 阶段 / 共 ${steps.length} 阶段`;
+  document.getElementById('stepTitle').textContent = steps[currentStep].title;
+
+  const stepItems = document.querySelectorAll('.step-item');
+  stepItems.forEach((item, i) => {
+    item.classList.toggle('active', i === currentStep);
+    if (i < currentStep) item.classList.add('done');
+    else item.classList.remove('done');
+  });
+
+  document.getElementById('prevBtn').disabled = currentStep === 0;
+  const nextBtn = document.getElementById('nextBtn');
+  if (currentStep === steps.length - 1) {
+    nextBtn.textContent = '完成 ✓';
+  } else {
+    nextBtn.textContent = '下一步 →';
+  }
+}
+
+function renderContent() {
+  document.getElementById('contentBody').innerHTML = steps[currentStep].content;
+  document.querySelector('.content-body').scrollTop = 0;
+}
+
+function goToStep(index) {
+  if (index >= 0 && index < steps.length) {
+    currentStep = index;
+    renderSidebar();
+    renderContent();
+    updateProgress();
+  }
+}
+
+function navigate(dir) {
+  const newIndex = currentStep + dir;
+  if (newIndex >= 0 && newIndex < steps.length) {
+    goToStep(newIndex);
+  } else if (newIndex === steps.length) {
+    showCompletion();
+  }
+}
+
+function showCompletion() {
+  document.getElementById('contentBody').innerHTML = `
+    <div class="content-section">
+      <div class="completion">
+        <div class="completion-icon">🎉</div>
+        <h2>教程已完成！</h2>
+        <p>IFRS17 预测模型系统宝塔面板部署教程全部学习完毕</p>
+        <br>
+        <div style="text-align:left;max-width:500px;margin:0 auto;">
+          <h4 style="color:var(--accent-hover);margin-bottom:12px;">快速参考</h4>
+          <div class="table-wrap">
+            <table>
+              <tr><th>端口</th><th>用途</th><th>对外</th></tr>
+              <tr><td>80</td><td>Nginx HTTP</td><td><span class="badge badge-green">是</span></td></tr>
+              <tr><td>443</td><td>Nginx HTTPS</td><td><span class="badge badge-green">是</span></td></tr>
+              <tr><td>8000</td><td>Gunicorn</td><td><span class="badge badge-red">否</span></td></tr>
+              <tr><td>8888</td><td>宝塔面板</td><td><span class="badge badge-yellow">限制IP</span></td></tr>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function copyCode(btn) {
+  const codeBlock = btn.closest('.code-block');
+  const pre = codeBlock.querySelector('pre');
+  const text = pre.innerText;
+
+  navigator.clipboard.writeText(text).then(() => {
+    btn.textContent = '已复制 ✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制';
+      btn.classList.remove('copied');
+    }, 2000);
+  });
+}
+
+function toggleCheck(item) {
+  item.classList.toggle('checked');
+}
+
+function toggleTrouble(card) {
+  card.classList.toggle('open');
+}
+
+// Keyboard navigation
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowLeft') navigate(-1);
+  if (e.key === 'ArrowRight') navigate(1);
+});
+
+// Init
+renderSidebar();
+renderContent();
+updateProgress();
+</script>
+</body>
+</html>

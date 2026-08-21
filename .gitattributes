@@ -1,0 +1,12 @@
+# 跨平台行尾统一（本地 Windows / 阿里云 Linux 共享同一仓库）
+* text=auto eol=lf
+
+# 明确二进制，避免误判文本
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.xlsx binary
+*.xls binary
+*.sqlite3 binary
+*.pdf binary

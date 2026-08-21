@@ -1,0 +1,22 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>{% block title %}新准则预测模型{% endblock %}</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <link rel="stylesheet" href="{% static 'css/styles.css' %}?v={{ SYSTEM_VERSION }}">
+    {% block extra_head %}{% endblock %}
+</head>
+<body>
+    <div id="app">
+        {% block app_content %}{% endblock %}
+    </div>
+    <div id="cell-detail-modal" style="display:none"></div>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

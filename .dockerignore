@@ -1,0 +1,30 @@
+# 排除不需要进入镜像构建上下文的大目录与临时文件
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+# 验证文件目录（213 个文件，体量巨大，且非运行所需）
+验证文件/
+# 前端/构建产物目录
+doc_build/
+shots/
+# 运行时生成的本地文件
+media/
+db.sqlite3
+staticfiles/
+*.md
+.env
+# 注意：Dockerfile / docker-entrypoint.sh / docker-compose.yml / nginx / mysql/init
+# 必须保留在构建上下文与主机目录中（构建镜像、运行容器、卷挂载都需要），切勿排除！
+# 仅排除本地开发期产物与凭证：
+deploy_config.json
+.wb_mysql_creds.json
+# 排除项目根级的报告/说明 HTML（非运行所需，但切勿用 *.html 否则会误删 Django 模板）
+IFRS17预测模型_项目故事.html
+IFRS17预测模型_开发测试报告.html
+db.sqlite3
+# 运行时计算缓存（容器内由应用重建，不固化进镜像）
+data_input/runtime_cache/

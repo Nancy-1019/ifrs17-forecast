@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+*.egg
+
+# Virtualenv
+venv/
+env/
+.env
+
+# Django
+*.sqlite3
+staticfiles/
+media/
+
+# 运行时缓存（计算中间产物，含实际数据，自动生成，非源码）
+runtime_cache/
+
+# 上传文件落盘（可能含敏感财务数据，按部署环境路径外部挂载）
+uploads/
+
+# 验证用原始 Excel（含真实财务数据，非代码依赖；结构化 fixture 已在 data_input/fixtures/）
+验证文件/
+
+# 调试脚本与临时产物（依赖真实数据，不适合纳入共享仓库）
+_wb_*.py
+_wb_*.json
+_wb_*.txt
+_wb_*.log
+*_leaks.json
+*.bak
+nul
+
+# 部署敏感配置（含服务器凭证/密码，禁止入库）
+deploy_config.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# 文档生成产物（保留 doc_build/build_*.py 生成脚本，忽略 html/xlsx 产物）
+doc_build/*.html
+doc_build/*.xlsx
+
+# Deploy (sensitive)
+deploy/setup.sh

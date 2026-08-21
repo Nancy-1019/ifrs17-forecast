@@ -1,0 +1,5 @@
+# 将现有生产库导出文件命名为 ifrs17_dump.sql 放到本目录（mysql/init/），
+# 容器首次启动时会自动执行它完成数据迁移（--databases 自带 CREATE DATABASE/USE）：
+#   mysqldump --databases ifrs17 -uroot -p > /path/to/ifrs17-system/mysql/init/ifrs17_dump.sql
+# 注意：仅首次（db_data 卷为空）会执行；之后数据由 db_data 卷持久化。
+# 本文件仅为占位，确保目录存在于仓库。

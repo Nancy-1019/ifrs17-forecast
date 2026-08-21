@@ -1,0 +1,21 @@
+{% extends 'base.html' %}
+{% load static %}
+
+{% block title %}新准则预测模型{% endblock %}
+
+{% block app_content %}
+<div id="app-root"></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Django后端注入的上下文
+    window.DJANGO_USER = {{ user_ctx_json|safe }};
+    window.CSRF_TOKEN = '{{ csrf_token }}';
+    window.SYSTEM_VERSION = '{{ SYSTEM_VERSION }}';
+</script>
+<script src="{% static 'js/config.js' %}?v={{ SYSTEM_VERSION }}"></script>
+<script src="{% static 'js/upload_excel.js' %}?v={{ SYSTEM_VERSION }}"></script>
+<script src="{% static 'js/upload_system_dock.js' %}?v={{ SYSTEM_VERSION }}"></script>
+<script src="{% static 'js/app.js' %}?v={{ SYSTEM_VERSION }}"></script>
+{% endblock %}

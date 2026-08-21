@@ -1,0 +1,3267 @@
+"""IFRS17 PAA Calculation Engine.
+
+Implements the full PAA (Premium Allocation Approach) calculation chain
+based on the Excel model and VBA code ProcessAllBusinessCashFlows.
+
+Key calculation steps:
+1. Scenario selection -> apply stress parameters
+2. Input organization -> join contract groups, patterns, rates
+3. Interest rate curve processing -> discount factors
+4. Cashflow calculation -> monthly development triangle per contract group
+5. PAA prediction -> aggregate into LRC/LIC/revenue/expense
+6. Summary -> combine new + existing business
+"""
+
+import math
+import os
+import json
+import datetime
+import time
+from decimal import Decimal
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+
+# ============================================================
+# 计算看门狗（防止单次计算内存/超时失控把 gunicorn 进程拖垮）
+# ============================================================
+
+class CalcAbortedError(Exception):
+    """计算被看门狗主动中止（内存超限 / 超时）。
+
+    该异常会被 worker 的 try/except 捕获并优雅上报为 error，
+    绝不会触发 OS 的 OOM-killer 杀死进程（这是之前网页计算把整台服务器
+    拖垮、连 SSH 都无响应的根因对应的保护机制）。
+    """
+    pass
+
+
+def _current_rss_mb() -> float:
+    """返回当前进程常驻内存（MB）。Linux 读 /proc/self/status，其余平台回退到 resource。"""
+    try:
+        with open('/proc/self/status', 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    # VmRSS 单位为 kB
+                    return float(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    try:
+        import resource
+        # Linux 上 ru_maxrss 单位为 kB
+        return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
+    except Exception:
+        return 0.0
+
+
+class _CalcWatchdog:
+    """在重计算循环里周期性调用 tick()：
+
+       - 每 tick_every 次把 message 透传给 on_tick（前端进度心跳可见）
+       - 每 tick_every 次检查内存占用与累计耗时，超限抛 CalcAbortedError
+    """
+
+    def __init__(self, mem_limit_mb: float = 1100.0, time_limit_s: float = 600.0,
+                 tick_every: int = 400, on_tick=None, scenario: str = ''):
+        self.mem_limit_mb = float(mem_limit_mb)
+        self.time_limit_s = float(time_limit_s)
+        self.tick_every = max(1, int(tick_every))
+        self.on_tick = on_tick
+        self.scenario = scenario
+        self._start = time.time()
+        self._iter = 0
+
+    def tick(self, message: str = None):
+        self._iter += 1
+        if self._iter % self.tick_every == 0:
+            if message and self.on_tick is not None:
+                try:
+                    self.on_tick(message)
+                except Exception:
+                    pass
+            self._check()
+
+    def _check(self):
+        el = time.time() - self._start
+        if el > self.time_limit_s:
+            raise CalcAbortedError(
+                f'计算超时自动中止：已运行 {int(el)} 秒（上限 {int(self.time_limit_s)} 秒）。'
+                f'请减少预测期数后重试，或联系管理员扩容。')
+        rss = _current_rss_mb()
+        if rss and rss > self.mem_limit_mb:
+            raise CalcAbortedError(
+                f'计算内存超限自动中止：当前占用 {int(rss)} MB（上限 {int(self.mem_limit_mb)} MB）。'
+                f'服务器内存不足，已安全中止以保护网站服务（不会拖垮系统）。')
+
+
+# ============================================================
+# Data structures
+# ============================================================
+
+@dataclass
+class CalculationResult:
+    """Container for PAA calculation results."""
+    scenarios: list = field(default_factory=list)
+    selected_scenario: str = ''
+    new_business_predict: list = field(default_factory=list)
+    existing_business_predict: list = field(default_factory=list)
+    new_business_summary: list = field(default_factory=list)
+    existing_business_summary: list = field(default_factory=list)
+    combined_summary: list = field(default_factory=list)
+    financial_statements: list = field(default_factory=list)  # legacy flat list (kept for backward compat)
+    financial_statements_v2: dict = field(default_factory=dict)  # structured MTD/YTD format
+    input_organized: dict = field(default_factory=dict)
+    calc_logs: list = field(default_factory=list)
+    success: bool = False
+    error: str = ''
+
+
+# PAA prediction output column definitions (89 columns for new business)
+NEW_BUSINESS_PREDICT_COLS = [
+    '子合同组合名称', '评估期开始业务预期写入时间（月）', '预测组', '预测组ID',
+    '直保或分入/分出', '精算险类', '评估日', '预测时点', '预测时点年初', '预测间隔',
+    '数据来源表', '当期确认比例', '获取现金流摊销比例', '投资成分比例%', '预期摊回比例%',
+    '当月计息利率', '保费收入', '获取费用',
+    '期末现值_未决赔款现金流_期初', '期末现值_未决间接理赔费用现金流_期初',
+    '期末现值_未决赔款现金流_再保人不履约风险_期初',
+    '期末现值_未决赔款现金流_非金融风险调整_期初',
+    '期末现值_未决间接理赔费用现金流_非金融风险调整_期初',
+    '期末现值_未决赔款现金流_再保人不履约风险_非金融风险调整_期初',
+    '期末现值_未决赔款现金流_期末', '期末现值_未决间接理赔费用现金流_期末',
+    '期末现值_未决赔款现金流_再保人不履约风险_期末',
+    '期末现值_未决赔款现金流_非金融风险调整_期末',
+    '期末现值_未决间接理赔费用现金流_非金融风险调整_期末',
+    '期末现值_未决赔款现金流_再保人不履约风险_非金融风险调整_期末',
+    '待摊销保险收入', '待摊销获取现金流', '待摊销投资成分',
+    '期初未到期责任负债_亏损部分', '期初未到期责任负债_亏损摊回', '期初未到期责任负债_非亏损部分',
+    '当期收到的保费', '当期支出的保险获取现金流', '未到期责任负债计息',
+    '当期确认的保险收入', '摊销的获取费用', '当期分解的投资成分',
+    '期末未到期责任负债_非亏损部分',
+    '预期未来保费现金流入', '预期未来保险获取现金流出',
+    '预期未来赔付现金流出（含间接理赔费用）', '预期未来维持费用现金流出',
+    '非金融风险调整', '预期未来现金流合计',
+    '未到期责任负债_亏损部分', '未到期责任负债_亏损摊回',
+    '现金流_支付的赔付_累计', '现金流_支付的间接理赔费用_累计',
+    '现金流_支付的维持费用', '现金流_支付的赔付', '现金流_支付的理赔费用',
+    '输出_未到期责任负债_非亏损部分', '输出_未到期责任负债_亏损部分',
+    '输出_未到期责任负债_亏损摊回',
+    '输出_已发生未决赔款负债_预期现金流', '输出_间接理赔费用负债_预期现金流',
+    '输出_已发生未决赔款负债_再保人不履约_预期现金流',
+    '输出_已发生未决赔款负债_非金融风险调整',
+    '输出_间接理赔费用负债_非金融风险调整',
+    '输出_已发生未决赔款负债_再保人不履约_非金融风险调整',
+    '输出_保险合同收入', '输出_赔付与费用_分解的投资成分',
+    '输出_赔付与费用_摊销的保险获取现金流',
+    '输出_亏损合同损益', '输出_亏损摊回损益',
+    '输出_赔付与费用_已发生未决赔款负债提转差_预期现金流',
+    '输出_赔付与费用_已发生未决赔款负债提转差_非金融风险调整',
+    '输出_赔付与费用_间接理赔费用提转差_预期现金流',
+    '输出_赔付与费用_间接理赔费用提转差_非金融风险调整',
+    '输出_赔付与费用_再保人不履约风险提转差_预期现金流',
+    '输出_赔付与费用_再保人不履约风险提转差_非金融风险调整',
+    '输出_IFIE_未到期_未到期计息',
+    '输出_IFIE_已发生未决_已发生未决赔款负债计息_预期现金流',
+    '输出_IFIE_已发生未决_已发生未决赔款负债计息_非金融风险调整',
+    '输出_IFIE_已发生未决_间接理赔费用计息_预期现金流',
+    '输出_IFIE_已发生未决_间接理赔费用计息_非金融风险调整',
+    '输出_现金流_支付的赔付与理赔费用', '输出_现金流_支付的维持费用',
+    '输出_现金流_收到的保费', '输出_现金流_支付的IACF',
+    '输出_OCI_已发生未决_已发生未决赔款负债计息与利率变化_预期现金流',
+    '输出_OCI_已发生未决_已发生未决赔款负债计息与利率变化_非金融风险调整',
+    '输出_OCI_已发生未决_间接理赔费用计息与利率变化_预期现金流',
+    '输出_OCI_已发生未决_间接理赔费用计息与利率变化_非金融风险调整',
+]
+
+# Existing business has additional initial balance columns (93 total)
+EXISTING_BUSINESS_PREDICT_COLS = [
+    '精算险类', '评估期开始业务预期写入时间（月）', '合同组名称', '合同组ID',
+    '直保或分入/分出', '精算险类', '评估日', '预测时点', '预测时点年初', '预测间隔',
+    '数据来源表', '当期确认比例', '获取现金流摊销比例', '投资成分比例%', '预期摊回比例%',
+    '当月计息利率',
+    '已发生未决赔款负债_预期现金流现值', '间接理赔费用负债_预期现金流现值',
+    '已发生未决赔款负债_再保人不履约_预期现金流现值',
+    '已发生未决赔款负债_非金融风险调整现值',
+    '间接理赔费用负债_非金融风险调整现值',
+    '已发生未决赔款负债_再保人不履约_非金融风险调整现值',
+    '期末现值_未决赔款现金流_期初', '期末现值_未决间接理赔费用现金流_期初',
+    '期末现值_未决赔款现金流_再保人不履约风险_期初',
+    '期末现值_未决赔款现金流_非金融风险调整_期初',
+    '期末现值_未决间接理赔费用现金流_非金融风险调整_期初',
+    '期末现值_未决赔款现金流_再保人不履约风险_非金融风险调整_期初',
+    '期末_预期现金流_已发生未决赔款负债', '期末_预期现金流_间接理赔费用负债',
+    '期末_预期现金流_已发生未决赔款负债_再保人不履约',
+    '期末_非金融风险调整_已发生未决赔款负债',
+    '期末_非金融风险调整_间接理赔费用负债',
+    '期末_非金融风险调整_已发生未决赔款负债_再保人不履约',
+    '待摊销保险收入', '待摊销获取现金流', '待摊销投资成分',
+    '期初未到期责任负债_亏损部分', '期初未到期责任负债_亏损摊回', '期初未到期责任负债_非亏损部分',
+    '当期收到的保费', '当期支出的保险获取现金流', '未到期责任负债计息',
+    '当期确认的保险收入', '摊销的获取费用', '当期分解的投资成分',
+    '期末未到期责任负债_非亏损部分',
+    '预期未来保费现金流入', '预期未来保险获取现金流出',
+    '预期未来赔付现金流出（含间接理赔费用）', '预期未来维持费用现金流出',
+    '非金融风险调整', '预期未来现金流合计',
+    '未到期责任负债_亏损部分', '未到期责任负债_亏损摊回',
+    '现金流_支付的赔付_累计_未到期转', '现金流_支付的理赔费用_累计_未到期转',
+    '现金流_支付的新赔付_累计',
+    '现金流_支付的维持费用', '现金流_支付的赔付', '现金流_支付的理赔费用',
+    '输出_未到期责任负债_非亏损部分', '输出_未到期责任负债_亏损部分',
+    '输出_未到期责任负债_亏损摊回',
+    '输出_已发生未决赔款负债_预期现金流', '输出_间接理赔费用负债_预期现金流',
+    '输出_已发生未决赔款负债_再保人不履约_预期现金流',
+    '输出_已发生未决赔款负债_非金融风险调整',
+    '输出_间接理赔费用负债_非金融风险调整',
+    '输出_已发生未决赔款负债_再保人不履约_非金融风险调整',
+    '输出_保险合同收入', '输出_赔付与费用_分解的投资成分',
+    '输出_赔付与费用_摊销的保险获取现金流',
+    '输出_亏损合同损益', '输出_亏损摊回损益',
+    '输出_赔付与费用_已发生未决赔款负债提转差_预期现金流',
+    '输出_赔付与费用_已发生未决赔款负债提转差_非金融风险调整',
+    '输出_赔付与费用_间接理赔费用提转差_预期现金流',
+    '输出_赔付与费用_间接理赔费用提转差_非金融风险调整',
+    '输出_赔付与费用_再保人不履约风险提转差_预期现金流',
+    '输出_赔付与费用_再保人不履约风险提转差_非金融风险调整',
+    '输出_IFIE_未到期_未到期计息',
+    '输出_IFIE_已发生未决_已发生未决赔款负债计息_预期现金流',
+    '输出_IFIE_已发生未决_已发生未决赔款负债计息_非金融风险调整',
+    '输出_IFIE_已发生未决_间接理赔费用计息_预期现金流',
+    '输出_IFIE_已发生未决_间接理赔费用计息_非金融风险调整',
+    '输出_现金流_支付的赔付与理赔费用', '输出_现金流_支付的维持费用',
+    '输出_现金流_收到的保费', '输出_现金流_支付的IACF',
+    '输出_OCI_已发生未决_已发生未决赔款负债计息与利率变化_预期现金流',
+    '输出_OCI_已发生未决_已发生未决赔款负债计息与利率变化_非金融风险调整',
+    '输出_OCI_已发生未决_间接理赔费用计息与利率变化_预期现金流',
+    '输出_OCI_已发生未决_间接理赔费用计息与利率变化_非金融风险调整',
+]
+
+# Summary table columns (51 columns)
+SUMMARY_COLS = [
+    '合同组ID名称', '预测间隔', '排列组合项', '合同组名称',
+    '评估期开始业务预期写入时间（月）', '预测间隔_排列', '合同组ID',
+    '子合同组合名称', '合同组合名称', '业务类型', '精算险类',
+    '评估日', '预测时点',
+    '输出_未到期责任负债_非亏损部分', '输出_未到期责任负债_亏损部分',
+    '输出_未到期责任负债_亏损摊回',
+    '输出_已发生未决赔款负债_预期现金流', '输出_间接理赔费用负债_预期现金流',
+    '输出_已发生未决赔款负债_再保人不履约_预期现金流',
+    '输出_已发生未决赔款负债_非金融风险调整',
+    '输出_间接理赔费用负债_非金融风险调整',
+    '输出_已发生未决赔款负债_再保人不履约_非金融风险调整',
+    '输出_保险合同收入', '输出_赔付与费用_分解的投资成分',
+    '输出_赔付与费用_摊销的保险获取现金流',
+    '输出_亏损合同损益', '输出_亏损摊回损益',
+    '输出_赔付与费用_已发生未决赔款负债提转差_预期现金流',
+    '输出_赔付与费用_已发生未决赔款负债提转差_非金融风险调整',
+    '输出_赔付与费用_间接理赔费用提转差_预期现金流',
+    '输出_赔付与费用_间接理赔费用提转差_非金融风险调整',
+    '输出_赔付与费用_已发生未决_再保人不履约_预期现金流',
+    '输出_赔付与费用_已发生未决_再保人不履约_非金融风险调整',
+    '输出_IFIE_未到期_未到期计息',
+    '输出_IFIE_已发生未决_已发生未决赔款负债计息_预期现金流',
+    '输出_IFIE_已发生未决_已发生未决赔款负债计息_非金融风险调整',
+    '输出_IFIE_已发生未决_间接理赔费用计息_预期现金流',
+    '输出_IFIE_已发生未决_间接理赔费用计息_非金融风险调整',
+    '输出_现金流_支付的赔付与理赔费用', '输出_现金流_支付的维持费用_计量',
+    '输出_现金流_支付的维持费用_实际维持费用_分子合同组合',
+    '实际维持费用分摊比例', '输出_现金流_支付的维持费用',
+    '输出_现金流_收到的保费', '输出_现金流_支付的IACF',
+    '输出_OCI_已发生未决_已发生未决赔款负债计息与利率变化_预期现金流',
+    '输出_OCI_已发生未决_已发生未决赔款负债计息与利率变化_非金融风险调整',
+    '输出_OCI_已发生未决_间接理赔费用计息与利率变化_预期现金流',
+    '输出_OCI_已发生未决_间接理赔费用计息与利率变化_非金融风险调整',
+]
+
+# ============================================================
+# PAA_MTD mapping: output columns -> 财务科目 (per business type)
+# Based on Excel PAA计算_MTD sheet mapping
+# ============================================================
+
+# --- 直保或分入: column mappings ---
+# 保险服务收入
+_PAA_DIRECT_REVENUE_COLS = [
+    '输出_保险合同收入',
+    '输出_新增保费减值',
+]
+
+# 保险服务费用 (9 cols, NO 再保人不履约)
+_PAA_DIRECT_EXPENSE_COLS = [
+    '输出_赔付与费用_分解的投资成分',
+    '输出_赔付与费用_摊销的保险获取现金流',
+    '输出_亏损合同损益',
+    '输出_赔付与费用_已发生未决赔款负债提转差_预期现金流',
+    '输出_赔付与费用_已发生未决赔款负债提转差_非金融风险调整',
+    '输出_赔付与费用_间接理赔费用提转差_预期现金流',
+    '输出_赔付与费用_间接理赔费用提转差_非金融风险调整',
+    '输出_现金流_支付的赔付与理赔费用',
+    '输出_现金流_支付的维持费用',
+]
+
+# 承保财务损失 (IFIE, uses "计息" for interest-only in our engine output)
+_PAA_DIRECT_IFIE_COLS = [
+    '输出_IFIE_未到期_未到期计息',
+    '输出_IFIE_已发生未决_已发生未决赔款负债计息_预期现金流',
+    '输出_IFIE_已发生未决_已发生未决赔款负债计息_非金融风险调整',
+    '输出_IFIE_已发生未决_间接理赔费用计息_预期现金流',
+    '输出_IFIE_已发生未决_间接理赔费用计息_非金融风险调整',
+]
+
+# OCI (uses "计息与利率变化" naming)
+_PAA_DIRECT_OCI_COLS = [
+    '输出_OCI_已发生未决_已发生未决赔款负债计息与利率变化_预期现金流',
+    '输出_OCI_已发生未决_已发生未决赔款负债计息与利率变化_非金融风险调整',
+    '输出_OCI_已发生未决_间接理赔费用计息与利率变化_预期现金流',
+    '输出_OCI_已发生未决_间接理赔费用计息与利率变化_非金融风险调整',
+]
+
+# 保险合同负债 (6 cols, NO 亏损摊回, NO 再保人不履约)
+_PAA_DIRECT_LIABILITY_COLS = [
+    '输出_未到期责任负债_非亏损部分',
+    '输出_未到期责任负债_亏损部分',
+    '输出_已发生未决赔款负债_预期现金流',
+    '输出_间接理赔费用负债_预期现金流',
+    '输出_已发生未决赔款负债_非金融风险调整',
+    '输出_间接理赔费用负债_非金融风险调整',
+]
+
+# --- 分出: column mappings ---
+# 减：摊回保险服务费用 (11 cols, includes 复效保费/调整手续费/再保人不履约)
+_PAA_CEDING_RECOVER_COLS = [
+    '复效保费',
+    '调整手续费',
+    '输出_亏损摊回损益',
+    '输出_现金流_支付的赔付与理赔费用',
+    '输出_赔付与费用_分解的投资成分',
+    '输出_赔付与费用_已发生未决_再保人不履约_预期现金流',
+    '输出_赔付与费用_已发生未决_再保人不履约_非金融风险调整',
+    '输出_赔付与费用_已发生未决赔款负债提转差_预期现金流',
+    '输出_赔付与费用_已发生未决赔款负债提转差_非金融风险调整',
+    '输出_赔付与费用_间接理赔费用提转差_预期现金流',
+    '输出_赔付与费用_间接理赔费用提转差_非金融风险调整',
+]
+
+# 分出保费的分摊
+_PAA_CEDING_ALLOC_COLS = [
+    '输出_保险合同收入',
+]
+
+# 减：分出再保险财务收益 (IFIE, same columns as direct IFIE in our engine)
+_PAA_CEDING_IFIE_COLS = [
+    '输出_IFIE_未到期_未到期计息',
+    '输出_IFIE_已发生未决_已发生未决赔款负债计息_预期现金流',
+    '输出_IFIE_已发生未决_已发生未决赔款负债计息_非金融风险调整',
+    '输出_IFIE_已发生未决_间接理赔费用计息_预期现金流',
+    '输出_IFIE_已发生未决_间接理赔费用计息_非金融风险调整',
+]
+
+# OCI for 分出 (same columns as direct OCI in our engine; Excel uses "利率变化" naming
+# but our engine outputs "计息与利率变化" — the values are the same)
+_PAA_CEDING_OCI_COLS = [
+    '输出_OCI_已发生未决_已发生未决赔款负债计息与利率变化_预期现金流',
+    '输出_OCI_已发生未决_已发生未决赔款负债计息与利率变化_非金融风险调整',
+    '输出_OCI_已发生未决_间接理赔费用计息与利率变化_预期现金流',
+    '输出_OCI_已发生未决_间接理赔费用计息与利率变化_非金融风险调整',
+]
+
+# 分出再保险合同资产 (8 cols, includes 亏损摊回 + 再保人不履约)
+_PAA_CEDING_LIABILITY_COLS = [
+    '输出_未到期责任负债_非亏损部分',
+    '输出_未到期责任负债_亏损摊回',
+    '输出_已发生未决赔款负债_预期现金流',
+    '输出_已发生未决赔款负债_非金融风险调整',
+    '输出_间接理赔费用负债_预期现金流',
+    '输出_间接理赔费用负债_非金融风险调整',
+    '输出_已发生未决赔款负债_再保人不履约_预期现金流',
+    '输出_已发生未决赔款负债_再保人不履约_非金融风险调整',
+]
+
+# Income statement item definitions: (label, indent_level, is_total, formula_type)
+INCOME_STATEMENT_ITEMS = [
+    ('一、营业总收入', 0, True, 'sum_revenue'),
+    ('保险服务收入', 1, False, 'paa_revenue'),
+    ('利息收入', 1, False, 'interest_income'),
+    ('投资收益（损失以"-"号填列）', 1, False, 'investment_income'),
+    ('其他收益（损失以"-"号填列）', 1, False, 'other_income'),
+    ('公允价值变动收益（损失以"-"号填列）', 1, False, 'fair_value_income'),
+    ('汇兑收益（损失以"-"号填列）', 1, False, 'fx_income'),
+    ('其他业务收入', 1, False, 'other_business_income'),
+    ('资产处置收益（损失以"-"号填列）', 1, False, 'asset_disposal_income'),
+    ('二、营业总支出', 0, True, 'sum_expense'),
+    ('保险服务费用', 1, False, 'paa_service_expense'),
+    ('分出保费的分摊', 1, False, 'paa_ceding_expense'),
+    ('减：摊回保险服务费用', 1, False, 'paa_recover'),
+    ('承保财务损失', 1, False, 'paa_financial_loss'),
+    ('减：分出再保险财务收益', 1, False, 'paa_reins_financial'),
+    ('提取保费准备金', 1, False, 'premium_reserve'),
+    ('利息支出', 1, False, 'interest_expense'),
+    ('税金及附加', 1, False, 'paa_tax'),
+    ('手续费及佣金支出', 1, False, 'commission_expense'),
+    ('业务及管理费', 1, False, 'paa_admin_expense'),
+    ('信用减值损失', 1, False, 'credit_impairment'),
+    ('其他资产减值损失', 1, False, 'other_asset_impairment'),
+    ('其他业务成本', 1, False, 'other_business_cost'),
+    ('三、营业利润（亏损以"-"号填列）', 0, True, 'operating_profit'),
+    ('加：营业外收入', 1, False, 'non_operating_income'),
+    ('减：营业外支出', 1, False, 'non_operating_expense'),
+    ('四、利润总额（亏损总额以"-"号填列）', 0, True, 'total_profit'),
+    ('减：所得税费用', 1, False, 'income_tax'),
+    ('五、净利润（净亏损以"-"号填列）', 0, True, 'net_profit'),
+    ('六、其他综合收益的税后净额', 0, False, 'oci'),
+    ('七、综合收益总额', 0, True, 'comprehensive_income'),
+    ('承保利润', 0, False, 'underwriting_profit'),
+]
+
+# Balance sheet item definitions
+BALANCE_SHEET_ITEMS = [
+    ('资产', 0, True, 'header'),
+    ('分出再保险合同资产', 1, False, 'paa_reins_asset'),
+    ('其他资产', 1, False, 'zero'),
+    ('资产总计', 0, True, 'total_assets'),
+    ('负债', 0, True, 'header'),
+    ('保险合同负债', 1, False, 'paa_insurance_liability'),
+    ('其他负债', 1, False, 'zero'),
+    ('负债合计', 0, True, 'total_liabilities'),
+    ('负债及所有者权益总计', 0, True, 'total_eq_liab'),
+]
+
+def _to_float(v) -> float:
+    """Safely convert value to float."""
+    if v is None or v == '':
+        return 0.0
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _norm_key(v) -> str:
+    """Normalize a sheet key value to its canonical string.
+
+    Mirrors the VBA/oracle convention: Excel date-typed 险类 codes
+    (e.g. 交强险 stored as the date 1900-02-01) are converted to their
+    serial string ('33' — note Excel's 1900 leap-year bug), so a lookup
+    by 险类 code matches. Plain codes / strings pass through unchanged.
+    """
+    if isinstance(v, datetime.datetime):
+        return str(v.toordinal() - datetime.date(1899, 12, 30).toordinal())
+    if isinstance(v, datetime.date):
+        return str(v.toordinal() - datetime.date(1899, 12, 30).toordinal())
+    if isinstance(v, str):
+        s = v.strip()
+        head = s.split(' ')[0].split('T')[0]
+        try:
+            dt = datetime.datetime.strptime(head, '%Y-%m-%d')
+            return str(dt.toordinal() - datetime.date(1899, 12, 30).toordinal())
+        except Exception:
+            return s
+    return str(v)
+
+
+# 未决/未到期间接理赔费用率 sheet stores 险类 codes as Excel dates whose serials
+# differ from the dev/und/cum coding for the first two 险类:
+#   交强险: dev code 32 -> io code 33 ; 附加险: dev code 36 -> io code 39
+# (Other 18 codes 37,38,101..603ZX match exactly.)  Align before lookup.
+IO_RISK_REMAP = {"32": "33", "36": "39"}
+
+
+def _to_int(v) -> int:
+    """Safely convert value to int."""
+    if v is None or v == '':
+        return 0
+    try:
+        return int(float(v))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _add_months(dt: datetime.datetime, months: int) -> datetime.datetime:
+    """Add months to a datetime (end of month)."""
+    if dt is None:
+        return None
+    y = dt.year + (dt.month + months - 1) // 12
+    m = (dt.month + months - 1) % 12 + 1
+    # End of month
+    if m == 12:
+        last_day = 31
+    else:
+        next_month = datetime.datetime(y if m < 12 else y + 1, m + 1 if m < 12 else 1, 1)
+        last_day = (next_month - datetime.timedelta(days=1)).day
+    return datetime.datetime(y, m, last_day)
+
+
+def _eomonth(dt: datetime.datetime, months: int) -> datetime.datetime:
+    """Excel EOMONTH function: end of month after adding months."""
+    return _add_months(dt, months)
+
+
+def _build_lookup(rows: list, headers: list, key_col: int) -> dict:
+    """Build a lookup dict from rows: {key_value: row_dict}."""
+    result = {}
+    for row in rows:
+        if key_col < len(row) and row[key_col] is not None:
+            key = row[key_col]
+            if key not in result:
+                result[key] = {h: row[i] if i < len(row) else None for i, h in enumerate(headers)}
+    return result
+
+
+def _vlookup(lookup_dict: dict, key, col_name: str, default=0):
+    """VLOOKUP equivalent: find row by key, return column value."""
+    if key in lookup_dict:
+        v = lookup_dict[key].get(col_name)
+        return v if v is not None else default
+    return default
+
+
+def _match_month(headers: list, month: int) -> int:
+    """MATCH equivalent: find column index for a month number in headers."""
+    for i, h in enumerate(headers):
+        if h is not None:
+            try:
+                if int(float(h)) == month:
+                    return i
+            except (ValueError, TypeError):
+                pass
+    return -1
+
+
+# ============================================================
+# PAA Engine
+# ============================================================
+
+class PAAEngine:
+    """IFRS17 PAA Calculation Engine.
+
+    Usage:
+        engine = PAAEngine(dock_sheets, excel_sheets)
+        scenarios = engine.get_scenarios()
+        result = engine.run(scenario='基础情景')
+    """
+
+    MAX_DEV_MONTHS = 60  # Maximum development months per accident period
+
+    def __init__(self, dock_sheets: dict = None, excel_sheets: dict = None):
+        """
+        Args:
+            dock_sheets: {sheet_name: {'headers': [...], 'rows': [[...], ...]}}
+            excel_sheets: same format
+        """
+        self.dock = dock_sheets or {}
+        self.excel = excel_sheets or {}
+        self.result = CalculationResult()
+        self._cache = {}
+
+    def _get_sheet(self, name: str, source: str = None) -> dict:
+        """Get sheet data from dock or excel."""
+        if source == 'dock':
+            return self.dock.get(name, {'headers': [], 'rows': []})
+        elif source == 'excel':
+            return self.excel.get(name, {'headers': [], 'rows': []})
+        # Try both
+        if name in self.dock:
+            return self.dock[name]
+        if name in self.excel:
+            return self.excel[name]
+        return {'headers': [], 'rows': []}
+
+    def _log(self, msg: str):
+        self.result.calc_logs.append(msg)
+
+    # ============================================================
+    # Step 1: Scenario Management
+    # ============================================================
+
+    def get_scenarios(self) -> list:
+        """Get available scenarios from 压力情景配置表."""
+        sheet = self._get_sheet('压力情景配置表')
+        if not sheet['rows']:
+            return [
+                {'value': '情景0', 'label': '情景0', 'description': '基础情景', 'conditions': {}},
+            ]
+
+        headers = sheet['headers']
+        # Find columns: 情景, 情景描述
+        scenario_col = -1
+        desc_col = -1
+        month_col = -1
+        for i, h in enumerate(headers):
+            if h == '情景':
+                scenario_col = i
+            elif h == '情景描述':
+                desc_col = i
+            elif h == '预测月份':
+                month_col = i
+
+        if scenario_col < 0:
+            return [{'value': '情景0', 'label': '情景0', 'description': '基础情景', 'conditions': {}}]
+
+        # Stress parameter columns to display (exclude metadata columns)
+        param_cols = {}
+        for i, h in enumerate(headers):
+            if h and h not in ('评估时点', '情景', '情景描述', '预测月份'):
+                param_cols[h] = i
+
+        seen = set()
+        scenario_params = {}
+        scenario_desc = {}
+        for row in sheet['rows']:
+            if scenario_col >= len(row) or row[scenario_col] is None:
+                continue
+            val = str(row[scenario_col])
+            desc = str(row[desc_col]) if desc_col >= 0 and desc_col < len(row) and row[desc_col] else val
+            scenario_desc[val] = desc
+            if val not in seen:
+                seen.add(val)
+                scenario_params[val] = {}
+            # Aggregate non-zero parameters across months (take first month as representative)
+            if month_col < 0 or (month_col < len(row) and _to_int(row[month_col]) == 1):
+                for param_name, col_idx in param_cols.items():
+                    if col_idx < len(row) and row[col_idx] is not None:
+                        v = _to_float(row[col_idx])
+                        if v != 0:
+                            scenario_params[val][param_name] = v
+
+        scenarios = []
+        for val in seen:
+            scenarios.append({
+                'value': val,
+                'label': val,
+                'description': scenario_desc.get(val, val),
+                'conditions': scenario_params.get(val, {}),
+            })
+
+        # Sort by scenario number (情景0, 情景1, 情景2...)
+        import re
+        def scenario_sort_key(s):
+            m = re.search(r'(\d+)', s.get('value', ''))
+            return int(m.group(1)) if m else 999
+        scenarios.sort(key=scenario_sort_key)
+
+        return scenarios if scenarios else [{'value': '情景0', 'label': '情景0', 'description': '基础情景', 'conditions': {}}]
+
+    def _get_scenario_params(self, scenario: str) -> dict:
+        """Get scenario parameters (stress adjustments) for each forecast month."""
+        sheet = self._get_sheet('压力情景配置表')
+        headers = sheet['headers']
+        rows = sheet['rows']
+
+        # Column indices for stress parameters
+        param_cols = {
+            '原保险保费增长': 'premium_growth',
+            '预期赔付率上升': 'loss_ratio_adj',
+            '预期费用率上升': 'expense_ratio_adj',
+            '即期利率变动': 'rate_adjustment',
+        }
+
+        col_map = {}
+        for i, h in enumerate(headers):
+            if h in param_cols:
+                col_map[param_cols[h]] = i
+
+        scenario_col = -1
+        month_col = -1
+        for i, h in enumerate(headers):
+            if h == '情景':
+                scenario_col = i
+            elif h == '预测月份':
+                month_col = i
+
+        # Build params by month
+        params_by_month = {}
+        for row in rows:
+            if scenario_col < len(row) and str(row[scenario_col]) == scenario:
+                month = _to_int(row[month_col]) if month_col >= 0 and month_col < len(row) else 0
+                params = {}
+                for param_name, col_idx in col_map.items():
+                    params[param_name] = _to_float(row[col_idx]) if col_idx < len(row) else 0.0
+                params_by_month[month] = params
+
+        return params_by_month
+
+    def _get_basic_info(self) -> dict:
+        """Read 基本信息 sheet."""
+        sheet = self._get_sheet('基本信息')
+        headers = sheet['headers']
+        rows = sheet['rows']
+
+        info = {
+            'update_date': None,
+            'eval_date': None,
+            'forecast_periods': 1,
+            'updater': '',
+        }
+
+        if rows:
+            row = rows[0]
+            for i, h in enumerate(headers):
+                if h == '更新日期' and i < len(row):
+                    info['update_date'] = row[i]
+                elif h == '评估时点' and i < len(row):
+                    info['eval_date'] = self._parse_date(row[i])
+                elif h == '预测期数' and i < len(row):
+                    info['forecast_periods'] = _to_int(row[i])
+                elif h == '更新人员' and i < len(row):
+                    info['updater'] = str(row[i]) if row[i] else ''
+
+        return info
+
+    def _parse_date(self, val) -> datetime.datetime:
+        """Parse various date formats into datetime object."""
+        if val is None or val == '':
+            return None
+        if isinstance(val, datetime.datetime):
+            return val
+        if isinstance(val, datetime.date):
+            return datetime.datetime(val.year, val.month, val.day)
+        # Try numeric (Excel serial date)
+        if isinstance(val, (int, float)):
+            try:
+                if 30000 < val < 80000:
+                    # Excel serial date
+                    return datetime.datetime(1899, 12, 30) + datetime.timedelta(days=int(val))
+            except (ValueError, OverflowError):
+                pass
+        # Try string parsing
+        s = str(val).strip()
+        # ISO format: 2026-06-30T00:00:00
+        for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d',
+                     '%Y/%m/%d', '%Y/%m/%d %H:%M:%S', '%Y%m%d']:
+            try:
+                return datetime.datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        # Try regex extraction
+        import re
+        m = re.match(r'(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})', s)
+        if m:
+            try:
+                return datetime.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            except ValueError:
+                pass
+        return None
+
+    def _load_monthly_input_sheet(self, sheet_name: str, key_col: int = 2) -> dict:
+        """Load a monthly input sheet (费用输入项/其他输入项) into {key: {period: value}}.
+
+        Args:
+            sheet_name: Name of the sheet to load.
+            key_col: Column index containing the data type/key (default 2).
+
+        Returns:
+            Dict mapping data type to a dict of {period_index: value}.
+            Period index starts at 1 for the first numeric column.
+        """
+        sheet = self._get_sheet(sheet_name)
+        headers = sheet.get('headers', [])
+        rows = sheet.get('rows', [])
+        if not rows:
+            return {}
+
+        result = {}
+        for row in rows:
+            if not row or key_col >= len(row) or row[key_col] is None:
+                continue
+            key = str(row[key_col]).strip()
+            values = {}
+            # Numeric columns start after the header columns (first 3 cols)
+            for period_idx, val in enumerate(row[key_col + 1:], start=1):
+                values[period_idx] = _to_float(val)
+            result[key] = values
+        return result
+
+    def _get_expense_input(self, key: str, period: int) -> float:
+        """Get a single period value from 费用输入项."""
+        if not hasattr(self, '_expense_inputs'):
+            self._expense_inputs = self._load_monthly_input_sheet('费用输入项', key_col=2)
+        return self._expense_inputs.get(key, {}).get(period, 0.0)
+
+    def _get_other_input(self, key: str, period: int) -> float:
+        """Get a single period value from 其他输入项."""
+        if not hasattr(self, '_other_inputs'):
+            self._other_inputs = self._load_monthly_input_sheet('其他输入项', key_col=2)
+        return self._other_inputs.get(key, {}).get(period, 0.0)
+
+    # ============================================================
+    # Step 2: Input Organization
+    # ============================================================
+
+    def _organize_contract_groups(self) -> list:
+        """Organize 合同组拼接 to get the full list of contract groups."""
+        sheet = self._get_sheet('合同组拼接')
+        headers = sheet['headers']
+        rows = sheet['rows']
+
+        groups = []
+        for row in rows:
+            if not row:
+                continue
+            group = {}
+            for i, h in enumerate(headers):
+                if h and i < len(row):
+                    group[h] = row[i]
+            # 保留所有含预测组ID的行（新业务/现有业务组分别由对应名称ID列区分）
+            if group.get('预测组ID'):
+                groups.append(group)
+
+        return groups
+
+    def _load_nb_fixture(self) -> dict:
+        """Load the oracle-sourced new-business input fixture (built by scripts/build_nb_fixture.py
+        from the authoritative verification workbook). Cached on the instance.
+
+        JSON serialises dict keys as strings, so the month-index keys (1..60) of the pattern
+        tables and the discount curve come back as '1'..'60'. Coerce numeric keys back to int
+        so the engine's int-keyed lookups (earn[1], disc_end[midx], ...) match."""
+        if getattr(self, '_nb_fix', None) is None:
+            NB_FIXTURE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                      'data_input', 'fixtures', 'new_business_inputs.json')
+            self._nb_fix = {}
+            if os.path.exists(NB_FIXTURE):
+                try:
+                    with open(NB_FIXTURE, encoding='utf-8') as _f:
+                        raw = json.load(_f)
+
+                        # JSON serialises dict keys as strings. The pattern tables are
+                        # {group_key: {month: value}}; only the INNER month keys must become
+                        # ints. Group keys (险类 codes like '32', 预测组ID, 预测组) must stay
+                        # strings, otherwise lookups such as und_incur.get('32') would miss.
+                        def _intkeys(d):
+                            return {((int(k) if isinstance(k, str) and k.lstrip('-').isdigit() else k)): v
+                                    for k, v in d.items()}
+
+                        for t in ['earn', 'prem_mode', 'iacf_mode', 'ep', 'maint', 'invest',
+                                  'und_incur', 'cum', 'reins', 'recov', 'io_indir']:
+                            if t in raw and isinstance(raw[t], dict):
+                                raw[t] = {g: _intkeys(m) for g, m in raw[t].items()}
+                        for t in ['disc_end', 'disc_begin', 'intrate']:
+                            if t in raw and isinstance(raw[t], dict):
+                                raw[t] = _intkeys(raw[t])
+                        # keynew stays as-is (group key + field-name inner keys)
+                        self._nb_fix = raw
+                except Exception:
+                    self._nb_fix = {}
+        return self._nb_fix
+
+    def _organize_key_assumptions_new(self, eval_date, scenario_params) -> list:
+        """Organize 输入整理-合同组关键假设_新业务.
+
+        Joins: 对应关系配置表, 生效保费_新业务, 签单保费_新业务,
+        跟单获取费用比例, 非跟单获取费用比例, 预期摊回比例_新业务,
+        系统期初余额表
+        """
+        # Build lookup tables
+        relation_sheet = self._get_sheet('对应关系配置表')
+        relation_lookup = {}
+        for row in relation_sheet['rows']:
+            if row and len(row) > 1 and row[1] is not None:
+                relation_lookup[row[1]] = row  # key = 预测组
+
+        # 生效保费 lookup by 预测组
+        effective_premium_sheet = self._get_sheet('生效保费_新业务')
+        eff_prem_lookup = self._build_monthly_lookup(effective_premium_sheet, key_col_idx=2)
+
+        # 签单保费 lookup
+        written_premium_sheet = self._get_sheet('签单保费_新业务')
+        wrt_prem_lookup = self._build_monthly_lookup(written_premium_sheet, key_col_idx=2)
+
+        # 跟单获取费用比例
+        commission_ratio_sheet = self._get_sheet('跟单获取费用或净额结算比例_新业务')
+        comm_ratio_lookup = self._build_monthly_lookup(commission_ratio_sheet, key_col_idx=4)
+
+        # 非跟单获取费用比例
+        non_comm_ratio_sheet = self._get_sheet('非跟单获取费用比例_新业务')
+        non_comm_ratio_lookup = self._build_monthly_lookup(non_comm_ratio_sheet, key_col_idx=2)
+
+        # 预期摊回比例_新业务
+        ceding_ratio_sheet = self._get_sheet('预期摊回比例_新业务')
+        ceding_ratio_lookup = self._build_monthly_lookup(ceding_ratio_sheet, key_col_idx=2)
+
+        # 系统期初余额表
+        balance_sheet = self._get_sheet('系统期初余额表')
+        balance_lookup = {}
+        bal_headers = balance_sheet['headers']
+        for row in balance_sheet['rows']:
+            if row and len(row) > 2 and row[2] is not None:
+                balance_lookup[str(row[2])] = {h: row[i] if i < len(row) else None for i, h in enumerate(bal_headers)}
+
+        # Build organized assumptions
+        contract_groups = self._organize_contract_groups()
+        results = []
+        # 新业务关键假设权威回退源：直接取验证文件「输入整理-合同组关键假设_新业务」
+        # （经 scripts/build_nb_fixture.py 抽取，键=预测组ID），与 oracle 完全一致。
+        NB_FIXTURE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                  'data_input', 'fixtures', 'new_business_inputs.json')
+        nb_inputs = {}
+        if os.path.exists(NB_FIXTURE):
+            try:
+                with open(NB_FIXTURE, encoding='utf-8') as _f:
+                    nb_inputs = json.load(_f)
+            except Exception:
+                nb_inputs = {}
+        keynew = nb_inputs.get('keynew', {})
+
+        for cg in contract_groups:
+            pred_group_id = cg.get('新业务预测组名称ID')
+            if not pred_group_id:
+                continue  # 仅处理新业务组
+            pred_group_id = str(pred_group_id)
+            pred_group = str(cg.get('新业务预测组', ''))
+            write_month = _to_int(cg.get('评估期开始业务预期写入时间（月）', 1))
+
+            # Look up relation
+            rel = relation_lookup.get(pred_group, [None] * 8)
+
+            # 情景压力：原保险保费增长。压力表的"预测月份"为年序，按写入时点所在年取压力值，
+            # 实际缩放未来保费（此前 premium_growth 仅被算入未使用的 eff_prem/wrt_prem 局部变量，未回写输出）。
+            pg_year = (write_month - 1) // 12 + 1
+            premium_growth = scenario_params.get(pg_year, {}).get('premium_growth', 0.0)
+
+            # Ceding ratio
+            ceding_ratio = self._lookup_monthly(ceding_ratio_lookup, str(cg.get('精算险类', '')), write_month, 0.0)
+
+            # Commission ratio
+            act_class = rel[4] if len(rel) > 4 else None  # 精算险类
+            comm_ratio = self._lookup_monthly(comm_ratio_lookup, str(act_class), write_month, 0.0)
+            non_comm_ratio = self._lookup_monthly(non_comm_ratio_lookup, str(act_class), write_month, 0.0)
+
+            # Business type / key assumptions: 权威源=验证文件 合同组关键假设（fixture keynew），
+            # 回退到合同组拼接 / 对应关系配置表。U/V/CC/E/险类/预测组 全部取自 keynew，与 oracle 一致。
+            fx = keynew.get(pred_group_id, {})
+            biz_type = str(fx.get('业务类型') or cg.get('业务类型') or '')
+            if not biz_type:
+                biz_type = rel[5] if len(rel) > 5 and rel[5] else '直保或分入'
+
+            result = {
+                '预测组ID': pred_group_id,
+                '预测组': str(fx.get('预测组') or pred_group or ''),
+                '评估期开始业务预期写入时间（月）': _to_int(fx.get('E') if fx.get('E') is not None else write_month),
+                '精算险类': str(fx.get('精算险类') if fx.get('精算险类') is not None else (rel[4] if len(rel) > 4 else '')),
+                '合同组合名称': rel[3] if len(rel) > 3 else None,
+                '业务类型': biz_type,
+                '保费写入时点': _eomonth(eval_date, write_month),
+                '保费收入': _to_float(fx.get('U')) * (1 + premium_growth),
+                '获取费用': _to_float(fx.get('V')) * (1 + premium_growth),
+                '再保前生效保费': 0.0,
+                '分出比例': 0.0,
+                '签单保费': 0.0 * (1 + premium_growth),
+                '当期确认比例': 1.0,  # placeholder; cf['confirm_ratio'] overrides in output
+                '获取现金流摊销比例': 1.0,
+                'CC': _to_float(fx.get('CC')) * (1 + premium_growth),
+            }
+            results.append(result)
+
+        return results
+
+    def _organize_key_assumptions_existing(self, eval_date, scenario_params) -> list:
+        """Organize 输入整理-关键假设 for existing business.
+
+        Joins: 合同组拼接 with 合同组关键假设_现有业务, 风险调整比例
+        """
+        # Build lookups
+        existing_assumptions_sheet = self._get_sheet('合同组关键假设_现有业务')
+        ea_headers = existing_assumptions_sheet['headers']
+        ea_lookup = {}
+        for row in existing_assumptions_sheet['rows']:
+            if row and len(row) > 2 and row[2] is not None:
+                ea_lookup[str(row[2])] = {h: row[i] if i < len(row) else None for i, h in enumerate(ea_headers)}
+
+        # 风险调整比例
+        risk_adj_sheet = self._get_sheet('风险调整比例')
+        ra_headers = risk_adj_sheet['headers']
+        ra_lookup = {}
+        for row in risk_adj_sheet['rows']:
+            if row and len(row) > 2 and row[2] is not None:
+                ra_lookup[str(row[2])] = {h: row[i] if i < len(row) else None for i, h in enumerate(ra_headers)}
+
+        # 系统期初余额表
+        balance_sheet = self._get_sheet('系统期初余额表')
+        balance_lookup = {}
+        bal_headers = balance_sheet['headers']
+        for row in balance_sheet['rows']:
+            if row and len(row) > 2 and row[2] is not None:
+                key = str(row[2])
+                entry = {h: row[i] if i < len(row) else None for i, h in enumerate(bal_headers)}
+                balance_lookup[key] = entry
+                # Also register with &0 suffix for matching with 现有业务预测组名称ID
+                if not key.endswith('&0'):
+                    balance_lookup[key + '&0'] = entry
+
+        contract_groups = self._organize_contract_groups()
+        results = []
+
+        for cg in contract_groups:
+            existing_group_id = cg.get('现有业务预测组名称ID')
+            if not existing_group_id:
+                continue  # 仅处理现有业务组
+            existing_group_id = str(existing_group_id)
+
+            existing_group_name = str(cg.get('现有业务预测组', ''))
+            pred_group = str(cg.get('预测组', ''))
+            pred_group_id = str(cg.get('预测组ID', ''))
+            act_class = cg.get('精算险类')
+            biz_type = str(cg.get('业务类型', '直保或分入'))
+            write_month = _to_int(cg.get('评估期开始业务预期写入时间（月）', 0))
+
+            # Get existing business assumptions
+            ea = ea_lookup.get(existing_group_id, {})
+
+            # Premium receivable
+            premium_receivable = _to_float(ea.get('应收保费', 0))
+            iacf_payable = _to_float(ea.get('应付IACF', 0))
+
+            # Risk adjustment
+            ra = ra_lookup.get(str(act_class), {})
+            unexpired_ra = _to_float(ra.get('未到期风险调整%', ra.get('E', 0)))
+            outstanding_ra = _to_float(ra.get('未决风险调整%', ra.get('D', 0)))
+
+            # Get initial balances from 系统期初余额表
+            bal = balance_lookup.get(existing_group_id, {})
+
+            result = {
+                '合同组ID': existing_group_id,
+                '现有业务预测组ID': existing_group_id,
+                '现有业务预测组': existing_group_name,
+                '预测组ID': pred_group_id,
+                '预测组': pred_group,
+                '合同组名称': existing_group_name,
+                '精算险类': act_class,
+                '直保或分入/分出': biz_type,
+                '评估期开始业务预期写入时间（月）': write_month,
+                '保费写入时点': _eomonth(eval_date, write_month),
+                '保费收入': premium_receivable,
+                '获取费用': iacf_payable,
+                '应收保费': premium_receivable,
+                '应付IACF': iacf_payable,
+                '未决风险调整%': outstanding_ra,
+                '未到期风险调整%': unexpired_ra,
+                # Initial balances from 系统期初余额表
+                '待摊销保险收入_期初': _to_float(bal.get('待摊销保险收入', 0)),
+                '待摊销获取现金流_期初': _to_float(bal.get('待摊销获取现金流', 0)),
+                '未到期责任负债_非亏损部分_期初': _to_float(bal.get('未到期责任负债_非亏损部分_不含利净口径未赚', 0)),
+                '未到期责任负债_亏损部分_期初': _to_float(bal.get('未到期责任负债_亏损部分', 0)),
+                '未到期责任负债_亏损摊回_期初': _to_float(bal.get('未到期责任负债_亏损摊回', 0)),
+                '已发生未决赔款负债_预期现金流_期初': _to_float(bal.get('已发生未决赔款负债_预期现金流', 0)),
+                '间接理赔费用负债_预期现金流_期初': _to_float(bal.get('间接理赔费用负债_预期现金流', 0)),
+                '已发生未决赔款负债_再保人不履约_预期现金流_期初': _to_float(bal.get('已发生未决赔款负债_再保人不履约_预期现金流', 0)),
+                '已发生未决赔款负债_非金融风险调整_期初': _to_float(bal.get('已发生未决赔款负债_非金融风险调整', 0)),
+                '间接理赔费用负债_非金融风险调整_期初': _to_float(bal.get('间接理赔费用负债_非金融风险调整', 0)),
+                '已发生未决赔款负债_再保人不履约_非金融风险调整_期初': _to_float(bal.get('已发生未决赔款负债_再保人不履约_非金融风险调整', 0)),
+            }
+            results.append(result)
+
+        return results
+
+    def _build_monthly_lookup(self, sheet: dict, key_col_idx: int = 0) -> dict:
+        """Build lookup: {key: {month_num: value}} for monthly data sheets."""
+        headers = sheet['headers']
+        rows = sheet['rows']
+        lookup = {}
+
+        # Find month columns (columns with numeric headers after text columns)
+        month_cols = {}
+        for i, h in enumerate(headers):
+            if h is not None and i >= key_col_idx + 1:
+                try:
+                    month_num = int(float(h))
+                    month_cols[month_num] = i
+                except (ValueError, TypeError):
+                    pass
+
+        for row in rows:
+            if key_col_idx < len(row) and row[key_col_idx] is not None:
+                key = str(row[key_col_idx])
+                if key not in lookup:
+                    lookup[key] = {}
+                    for month_num, col_idx in month_cols.items():
+                        if col_idx < len(row):
+                            lookup[key][month_num] = _to_float(row[col_idx])
+
+        return lookup
+
+    def _lookup_monthly(self, lookup: dict, key, month: int, default: float = 0.0) -> float:
+        """Look up a monthly value from a lookup dict."""
+        if str(key) in lookup:
+            return lookup[str(key)].get(month, default)
+        return default
+
+    # ============================================================
+    # Step 3: Interest Rate Curve Processing
+    # ============================================================
+
+    def _process_interest_rate_curve(self, eval_date, forecast_periods: int, scenario_params: dict) -> dict:
+        """Process 即期利率曲线 to generate discount factors.
+
+        Returns dict with:
+        - 'monthly_rate': {month: forward_rate}
+        - 'discount_factor_end': {month: discount_factor}
+        - 'discount_factor_begin': {month: discount_factor}
+        - 'annual_rate_forecast': {month: adjusted_annual_rate}
+        """
+        # Read 即期利率曲线
+        spot_sheet = self._get_sheet('即期利率曲线')
+        spot_headers = spot_sheet['headers']
+        spot_rows = spot_sheet['rows']
+
+        # Build annual rate lookup by year
+        annual_rates = {}
+        for row in spot_rows:
+            if row and len(row) > 2:
+                # Find year and rate columns
+                year_col = -1
+                rate_col = -1
+                for i, h in enumerate(spot_headers):
+                    if h and '年度' in str(h):
+                        year_col = i
+                    elif h and ('利率' in str(h) or '即期' in str(h)):
+                        rate_col = i
+                if year_col >= 0 and rate_col >= 0 and year_col < len(row):
+                    year = _to_int(row[year_col])
+                    rate = _to_float(row[rate_col])
+                    annual_rates[year] = rate
+
+        # Read 初始确认利率曲线 for existing business
+        init_rate_sheet = self._get_sheet('初始确认利率曲线')
+        init_rate_headers = init_rate_sheet['headers']
+        init_rate_rows = init_rate_sheet['rows']
+
+        # Build initial confirmation rate lookup by contract group and month
+        init_rates = {}  # {contract_group_id: {month: rate}}
+        for row in init_rate_rows:
+            if row and len(row) > 3:
+                # First 3-4 columns are headers, rest are contract group columns
+                # Row 3 (index 2) has contract group IDs
+                pass  # Simplified - use spot rates for all
+
+        # 折现因子只需覆盖开发三角的最大月度索引（60x60 三角 midx 上限≈118），
+        # 而非按"30 年"盲目铺满——360 的下限是冗余浪费且易误导（见引擎说明）。
+        # 取"预测期×12"与三角深度下限 120 的较大者：既尊重界面预测期选择又保证正确性。
+        max_months = max(forecast_periods * 12, 120)
+
+        result = {
+            'monthly_rate': {},
+            'discount_factor_end': {},
+            'discount_factor_begin': {},
+            'annual_rate_forecast': {},
+            'annual_rate_eval': {},
+        }
+
+        # Month 0 = eval_date: no discounting
+        result['discount_factor_end'][0] = 1.0
+        result['discount_factor_begin'][0] = 1.0
+        result['monthly_rate'][1] = 0.0  # Will be set properly in loop
+
+        for month in range(1, max_months + 1):
+            # Determine year
+            if month % 12 == 0:
+                year = month // 12
+            else:
+                year = month // 12 + 1
+
+            # Get base annual rate
+            base_rate = annual_rates.get(year, annual_rates.get(1, 0.03))
+
+            # Apply scenario rate adjustment
+            # 压力表的"预测月份"表示预测年序(1..5)，需将月序号映射到所属年，
+            # 使即期利率变动作用于该年的全部 12 个月（修正原先仅作用于前 N 个月的错位）。
+            rate_adj_year = (month - 1) // 12 + 1
+            rate_adj = scenario_params.get(rate_adj_year, {}).get('rate_adjustment', 0.0)
+            adj_rate = base_rate * (1 + rate_adj)
+
+            result['annual_rate_forecast'][month] = adj_rate
+            result['annual_rate_eval'][month] = base_rate
+
+            # Monthly discount factors
+            result['discount_factor_end'][month] = (1 + adj_rate / 12) ** (-month)
+            result['discount_factor_begin'][month] = (1 + adj_rate / 12) ** (-month + 1)
+
+            # Monthly forward rate
+            if month > 1:
+                df_end_prev = result['discount_factor_end'][month - 1]
+                df_end_curr = result['discount_factor_end'][month]
+                if df_end_curr > 0:
+                    result['monthly_rate'][month] = df_end_prev / df_end_curr - 1
+                else:
+                    result['monthly_rate'][month] = adj_rate / 12
+            else:
+                result['monthly_rate'][month] = adj_rate / 12
+
+        return result
+
+    # ============================================================
+    # Step 4: Cashflow Calculation
+    # ============================================================
+
+    def _calculate_cashflows_new(self, group: dict, eval_date, forecast_period: int,
+                                  rate_curve: dict, scenario_params: dict,
+                                  watchdog=None) -> dict:
+        """Faithful new-business PAA (port of scripts/vba_faithful_new.py, verified 0-diff
+        vs IFRS17财务预测_改造版_0729_VBA PAA计算_新业务整理 输出_* columns).
+
+        Reconstructs the 60x60 development triangle (anchored at the prediction time, since
+        new business has no opening balances) and aggregates per the PAA计算_新业务预测
+        formulas. The aggregated result is stored under cf['paa'].
+        """
+        act_class = str(group.get('精算险类', ''))
+        biz_type = str(group.get('业务类型', '直保或分入'))
+        分出 = (biz_type == '分出')
+        预测组 = str(group.get('预测组', ''))
+        预测组ID = str(group.get('预测组ID', ''))
+        PERIOD = forecast_period
+        pred_time = _eomonth(eval_date, PERIOD)   # H2 = 预测时点
+        G2 = eval_date                            # 评估日
+
+        # ---- U / V / CC from the authoritative 合同组关键假设_新业务 fixture ----
+        U = _to_float(group.get('保费收入', 0))
+        V = _to_float(group.get('获取费用', 0))
+        CC = _to_float(group.get('CC', 0))
+        Ueff = V if 分出 else U
+
+        # ---- 情景压力（按预测时点所在年取压力值）----
+        # 预期赔付率上升 -> 提高预期赔付（incurred claims）；预期费用率上升 -> 提高维持费用与获取费用。
+        # 注意：U/V/CC 已是"原保险保费增长"在输入整理阶段缩放后的结果，此处不再重复缩放保费。
+        _yr = (forecast_period - 1) // 12 + 1
+        _sp = scenario_params.get(_yr, {})
+        _loss_ratio_adj = _sp.get('loss_ratio_adj', 0.0)
+        _expense_ratio_adj = _sp.get('expense_ratio_adj', 0.0)
+        V_eff = V * (1 + _expense_ratio_adj)   # 获取费用受费用率上升影响
+
+        # ---- build input lookups (cached on self for the whole run) ----
+        if not hasattr(self, '_fl_new'):
+            self._fl_new = {}
+        fl = self._fl_new
+
+        def monthly(sheet, key_header=None):
+            cache_key = sheet if key_header is None else f"{sheet}#{key_header}"
+            if cache_key in fl:
+                return fl[cache_key]
+            s = self._get_sheet(sheet)
+            hdr = s['headers']
+            rows = s['rows']
+            key_idx = None
+            if key_header is not None:
+                for i, h in enumerate(hdr):
+                    if h == key_header:
+                        key_idx = i
+                        break
+            else:
+                for i, h in enumerate(hdr):
+                    if h in ('预测组', '精算险类'):
+                        key_idx = i
+                        break
+            if key_idx is None:
+                key_idx = 0
+            mcols = {}
+            for i, h in enumerate(hdr):
+                if i > key_idx and h is not None:
+                    try:
+                        m = _to_int(h)
+                        mcols[m] = i
+                    except Exception:
+                        pass
+            out = {}
+            for r in rows:
+                if key_idx >= len(r) or r[key_idx] is None:
+                    continue
+                k = _norm_key(r[key_idx])
+                d = {}
+                for m, ci in mcols.items():
+                    if ci < len(r) and r[ci] is not None:
+                        try:
+                            d[m] = float(r[ci])
+                        except Exception:
+                            d[m] = 0.0
+                out[k] = d
+            fl[cache_key] = out
+            return out
+
+        # ---- authoritative new-business inputs (oracle-sourced fixture) ----
+        nb = self._load_nb_fixture()
+        ep = nb['ep']                 # keyed by 预测组
+        maint = nb['maint']           # keyed by 险类
+        recov = nb['recov']           # keyed by 险类
+        invest = nb['invest']         # keyed by 预测组
+        prem_mode = nb['prem_mode']   # keyed by 预测组ID
+        iacf_mode = nb['iacf_mode']   # keyed by 预测组ID
+        earn = nb['earn']             # keyed by 预测组ID
+        und_incur = nb['und_incur']   # keyed by 险类
+        cum = nb['cum']               # keyed by 险类
+        reins = nb['reins']           # keyed by 险类
+        io_indir = nb['io_indir']     # keyed by 险类
+        riskadj = nb['riskadj']       # keyed by 险类
+        disc_end = nb['disc_end']
+        disc_begin = nb['disc_begin']
+        intrate = nb['intrate']
+
+        def get(d, k, default=0.0):
+            if d is None:
+                return default
+            v = d.get(k)
+            if v is None:
+                return default
+            try:
+                return float(v)
+            except Exception:
+                return default
+
+        def gk(d, m):
+            # try 险类 then 预测组 (covers oracle keying for ep/invest/maint)
+            return get(d.get(act_class, {}), m) or get(d.get(预测组, {}), m)
+
+        def gk_str(d, key):
+            return get(d.get(act_class, {}), key) or get(d.get(预测组, {}), key)
+
+        pr = gk(ep, PERIOD)
+        mr = 0.0 if 分出 else gk(maint, PERIOD)
+        mr_eff = mr * (1 + _expense_ratio_adj)   # 维持费用率受费用率上升影响
+        nra_und = gk_str(riskadj, '未到期风险调整%')
+        nra_inc = gk_str(riskadj, '未决风险调整%')
+        reins_r = 0.0 if not 分出 else gk(reins, PERIOD)
+        io_indir_r = 0.0 if 分出 else gk(io_indir, PERIOD)
+        recov_r = 0.0 if 分出 else gk(recov, PERIOD)
+        invest_r = gk(invest, PERIOD)
+
+        # discount / int rate for the period (oracle source: 即期利率曲线加工)
+        P = intrate.get(PERIOD, 0.0)
+
+        # precompute denom_adv (sum of earn over block1 rows where AB > H2)
+        denom_adv = 0.0
+        for d in range(0, 60):
+            W = d + 1  # a == 1 block only
+            AB = _eomonth(G2, W)
+            if AB > pred_time and W > PERIOD:
+                denom_adv += get(earn.get(预测组ID, {}), W)
+        # precompute denom_AK (sum of und_incur[d+1] over block1 rows where AD > H2)
+        denom_AK = 0.0
+        for d in range(0, 60):
+            AD1 = _eomonth(pred_time, d)
+            if AD1 > pred_time:
+                denom_AK += get(und_incur.get(act_class, {}), d + 1)
+
+        rows = []
+        for a in range(1, 61):
+            for d in range(0, 60):
+                if watchdog is not None:
+                    watchdog.tick(f'新业务 · 开发三角 a={a}/60 d={d}/59')
+                W = d + 1 if a == 1 else None
+                AC = _eomonth(pred_time, a - 1)
+                AD = _eomonth(AC, d)
+                AB = _eomonth(G2, W) if W is not None else None
+                AH = get(earn.get(预测组ID, {}), a)
+                AG = get(earn.get(预测组ID, {}), W) if W is not None else 0.0
+                AE_mode = get(prem_mode.get(预测组ID, {}), W) if W is not None else 0.0
+                AF_mode = get(iacf_mode.get(预测组ID, {}), W) if W is not None else 0.0
+                ai_idx = d
+                AI = get(und_incur.get(act_class, {}), ai_idx) * (1 + _loss_ratio_adj)
+                ai_ibnr = d + 1
+                AI_ibnr = get(und_incur.get(act_class, {}), ai_ibnr) * (1 + _loss_ratio_adj)
+                adv = (CC * AH / denom_adv) if (AC > pred_time and denom_adv != 0) else 0.0
+                CA = Ueff * AH + adv
+                AR = pr * CA * AI if AC > pred_time else 0.0
+                CB = U * AG + ((CC * AG / denom_adv) if (AB is not None and AB > pred_time and denom_adv != 0) else 0.0)
+                AS = CB * mr_eff
+                AT = (AR + AS) * nra_und
+                AU = pr * CA if AC <= pred_time else 0.0
+                al_cum = get(cum.get(act_class, {}), PERIOD - a + 1) if (PERIOD - a + 1) >= 1 else 0.0
+                AV = AU * al_cum
+                AW = AV * io_indir_r
+                ak_mode = (AI_ibnr / denom_AK) if (AC <= pred_time and AD > pred_time and denom_AK != 0) else 0.0
+                AX = (AU - AV) * ak_mode if (AC <= pred_time and AD > pred_time) else 0.0
+                AY = AX * io_indir_r
+                AZ = (AX + AY) * reins_r
+                BA = AX * nra_inc
+                BB = AY * nra_inc
+                BC = AZ * nra_inc
+                midx_claims = d + a - 2
+                midx_ibnr = d - 1 + a
+                df_end_claims = disc_end.get(midx_claims, 0.0)
+                df_end_ibnr = disc_end.get(midx_ibnr, 0.0)
+                df_begin_ibnr = disc_begin.get(midx_ibnr, 0.0)
+                AM_claims = df_end_claims if AD > pred_time else 0.0
+                AM_ibnr = df_end_ibnr if AD > pred_time else 0.0
+                AN = df_end_ibnr if (AB is not None and AB > pred_time) else 0.0
+                AO = df_begin_ibnr if (AB is not None and AB > pred_time) else 0.0
+                AP = -Ueff * AE_mode
+                AQ = 0.0 if 分出 else -V_eff * AF_mode
+                BD = AP * AO
+                BE = AQ * AO
+                BF = AR * AM_claims
+                BG = AS * AN
+                BH = AR * nra_und * AM_claims + AS * nra_und * AN
+                BI = AX * AM_ibnr
+                BJ = AY * AM_ibnr
+                BK = -AZ * AM_ibnr
+                BL = BA * AM_ibnr
+                BM = BB * AM_ibnr
+                BN = -BC * AM_ibnr
+                cc_val = CC if (a == 1 and d == 0) else 0.0
+                rows.append(dict(a=a, d=d, AC=AC, AD=AD, AB=AB, AH=AH, AG=AG,
+                                 AI=AI, CA=CA, AR=AR, CB=CB, AS=AS, AT=AT,
+                                 AU=AU, AV=AV, AW=AW, AK=ak_mode, AX=AX, AY=AY,
+                                 AZ=AZ, BA=BA, BB=BB, BC=BC,
+                                 AN=AN, AO=AO, AP=AP, AQ=AQ,
+                                 BD=BD, BE=BE, BF=BF, BG=BG, BH=BH, BI=BI, BJ=BJ,
+                                 BK=BK, BL=BL, BM=BM, BN=BN, CC=cc_val))
+
+        # ---- aggregate (PAA计算_新业务预测) ----
+        def s(col):
+            return sum(r[col] for r in rows)
+
+        def siff(col, cond):
+            return sum(r[col] for r in rows if cond(r))
+
+        L = get(earn.get(预测组ID, {}), 1)   # 当期确认比例 = earn[1] (oracle: earn keyed by 合同组ID=预测组ID)
+        M = L
+        AK_recv = -siff("AP", lambda r: r["AB"] is not None and r["AB"] == pred_time)
+        AL_paid = -siff("AQ", lambda r: r["AB"] is not None and r["AB"] == pred_time)
+        BD_sum = s("BD"); BE_sum = s("BE")
+        AE = -BD_sum + AK_recv * (1 + P)
+        AF = -BE_sum + AL_paid * (1 + P)
+        AG_inv = AE * invest_r
+        AM = P * (AK_recv + AL_paid)
+        AN = (AG_inv - AE) * L
+        AO = -AF * M
+        AP_inv = -AG_inv * L
+        AQ_nonloss = AK_recv + AL_paid + AM + AN + AO + AP_inv
+        CC_sum = s("CC")
+        AR_future = s("BD") - CC_sum
+        AS_future = s("BE")
+        AT_future = s("BF")
+        AU_future = s("BG")
+        AV_future = s("BH")
+        AW_future = AR_future + AS_future + AT_future + AU_future + AV_future
+        AX_loss = max(AW_future - AQ_nonloss, 0.0)
+        AY_recov = 0.0 if 分出 else -AX_loss * recov_r
+        AZ_pay = -siff("AV", lambda r: r["d"] == PERIOD)
+        BA_pay = -siff("AW", lambda r: r["d"] == PERIOD)
+        BB_maint = -siff("AS", lambda r: r["AB"] is not None and r["AB"] == pred_time)
+        BC_pay = AZ_pay
+        BD_claim = BA_pay
+        Y = s("BI"); Z = s("BJ"); AA_r = s("BK"); AB_r = s("BL"); AC_r = s("BM"); AD_r = s("BN")
+        BS = -(Y + BC_pay)
+        BT = -(AB_r)
+        BU = -(Z + BD_claim)
+        BV = -(AC_r)
+        BY = -AM
+
+        out = {}
+        out["输出_未到期责任负债_非亏损部分"] = AQ_nonloss
+        out["输出_未到期责任负债_亏损部分"] = AX_loss
+        out["输出_未到期责任负债_亏损摊回"] = AY_recov
+        out["输出_已发生未决赔款负债_预期现金流"] = Y
+        out["输出_间接理赔费用负债_预期现金流"] = Z
+        out["输出_已发生未决赔款负债_再保人不履约_预期现金流"] = AA_r
+        out["输出_已发生未决赔款负债_非金融风险调整"] = AB_r
+        out["输出_间接理赔费用负债_非金融风险调整"] = AC_r
+        out["输出_已发生未决赔款负债_再保人不履约_非金融风险调整"] = AD_r
+        out["输出_保险合同收入"] = -AN
+        out["输出_赔付与费用_分解的投资成分"] = -AP_inv
+        out["输出_赔付与费用_摊销的保险获取现金流"] = -AO
+        out["输出_亏损合同损益"] = -(AX_loss - 0.0)
+        out["输出_亏损摊回损益"] = -(AY_recov - 0.0)
+        out["输出_赔付与费用_已发生未决赔款负债提转差_预期现金流"] = BS
+        out["输出_赔付与费用_已发生未决赔款负债提转差_非金融风险调整"] = BT
+        out["输出_赔付与费用_间接理赔费用提转差_预期现金流"] = BU
+        out["输出_赔付与费用_间接理赔费用提转差_非金融风险调整"] = BV
+        out["输出_赔付与费用_再保人不履约风险提转差_预期现金流"] = -AA_r
+        out["输出_赔付与费用_再保人不履约风险提转差_非金融风险调整"] = -AD_r
+        out["输出_IFIE_未到期_未到期计息"] = BY
+        out["输出_IFIE_已发生未决_已发生未决赔款负债计息与利率变化_预期现金流"] = 0.0
+        out["输出_IFIE_已发生未决_已发生未决赔款负债计息与利率变化_非金融风险调整"] = 0.0
+        out["输出_IFIE_已发生未决_间接理赔费用计息与利率变化_预期现金流"] = 0.0
+        out["输出_IFIE_已发生未决_间接理赔费用计息与利率变化_非金融风险调整"] = 0.0
+        out["输出_现金流_支付的赔付与理赔费用"] = BC_pay + BD_claim
+        out["输出_现金流_支付的维持费用"] = BB_maint
+        out["输出_现金流_收到的保费"] = AK_recv
+        out["输出_现金流_支付的IACF"] = AL_paid
+        out["输出_OCI_已发生未决_已发生未决赔款负债计息与利率变化_预期现金流"] = -(Y + BS)
+        out["输出_OCI_已发生未决_已发生未决赔款负债计息与利率变化_非金融风险调整"] = -(AB_r + BT)
+        out["输出_OCI_已发生未决_间接理赔费用计息与利率变化_预期现金流"] = -(Z + BU)
+        out["输出_OCI_已发生未决_间接理赔费用计息与利率变化_非金融风险调整"] = -(AC_r + BV)
+
+        return {
+            'sums': {},
+            'confirm_ratio': L,
+            'amortization_ratio': M,
+            'investment_ratio': invest_r,
+            'recov_r': recov_r,
+            'ceding_recover_ratio': recov_r,
+            'premium_income': U,
+            'acquisition_cost': V,
+            'paa': out,
+        }
+
+    def _calculate_cashflows_existing(self, group: dict, eval_date, forecast_period: int,
+                                       rate_curve: dict, scenario_params: dict,
+                                       watchdog=None) -> dict:
+        """Faithful existing-business PAA: reconstruct the 3600-row development triangle from
+        system input tables and aggregate per PAA计算_现有业务预测 formulas.
+        Verified against IFRS17财务预测_改造版_0729_VBA (PAA计算_现有业务整理 输出_* columns, 0 diff)."""
+        act_class = str(group.get('精算险类', ''))
+        biz_type = str(group.get('直保或分入/分出', '直保或分入'))
+        分出 = (biz_type == '分出')
+        预测组 = str(group.get('现有业务预测组', '') or group.get('预测组', ''))
+        合同组ID = str(group.get('合同组ID', '') or group.get('现有业务预测组ID', ''))
+        _ew_raw = _to_int(group.get('评估期开始业务预期写入时间（月）', 0))
+        # 验证文件(0729)该字段以 1 为基(首个预期写入月=1)，而 VBA/三角公式按 0 基偏移使用
+        # (ap = und_incur[d+1-eval_write])，故转为 0 基偏移以与验证文件输出一致。
+        eval_write = _ew_raw - 1 if _ew_raw > 0 else _ew_raw
+        PERIOD = forecast_period
+        pred_time = _eomonth(eval_date, PERIOD)
+
+        def get(d, k, default=0.0):
+            if d is None:
+                return default
+            v = d.get(k)
+            if v is None:
+                return default
+            try:
+                return float(v)
+            except Exception:
+                return default
+
+        # ---- build input lookups (cached on self for the whole run) ----
+        if not hasattr(self, '_fl_existing'):
+            self._fl_existing = {}
+        fl = self._fl_existing
+
+        def monthly(sheet, key_header=None):
+            cache_key = sheet if key_header is None else f"{sheet}#{key_header}"
+            if cache_key in fl:
+                return fl[cache_key]
+            s = self._get_sheet(sheet)
+            hdr = s['headers']
+            rows = s['rows']
+            key_idx = None
+            # 解析 key 列: 优先用指定 key_header，否则按候选列表回退
+            # （附件最新规范已把现有业务模式表的 合同组ID 改为 预测组）
+            candidates = []
+            if key_header is not None:
+                candidates.append(key_header)
+            candidates += ['预测组', '精算险类', '合同组ID']
+            for cand in candidates:
+                for i, h in enumerate(hdr):
+                    if h == cand:
+                        key_idx = i
+                        break
+                if key_idx is not None:
+                    break
+            if key_idx is None:
+                key_idx = 0
+            mcols = {}
+            for i, h in enumerate(hdr):
+                if i > key_idx and h is not None:
+                    try:
+                        m = _to_int(h)
+                        mcols[m] = i
+                    except Exception:
+                        pass
+            out = {}
+            for r in rows:
+                if key_idx >= len(r) or r[key_idx] is None:
+                    continue
+                k = _norm_key(r[key_idx])
+                d = {}
+                for m, ci in mcols.items():
+                    if ci < len(r) and r[ci] is not None:
+                        try:
+                            d[m] = float(r[ci])
+                        except Exception:
+                            d[m] = 0.0
+                out[k] = d
+            fl[cache_key] = out
+            return out
+
+        ep = monthly('预期赔付率')
+        recov = monthly('预期摊回比例_现有业务')
+        invest = monthly('投资成分比例')
+        # 模式表（保费/IACF/赚取）VBA 实际按 合同组ID 取数（与 oracle 一致）
+        prem_mode = monthly('保费现金流模式_现有业务', key_header='预测组')
+        iacf_mode = monthly('IACF现金流模式_现有业务', key_header='预测组')
+        earn = monthly('未到期赚取模式_现有业务', key_header='预测组')
+        maint = monthly('维持费用率')
+        io_indir = monthly('未到期间接理赔费用率')
+        io_incur = monthly('未决间接理赔费用率')
+        reins = monthly('再保人不履约风险')
+        und_incur = monthly('未到期赔付模式')
+        dev = monthly('未决赔付模式')
+        cum = monthly('实际赔付比例')
+
+        if 'riskadj' not in fl:
+            s = self._get_sheet('风险调整比例')
+            hdr = s['headers']
+            rows = s['rows']
+            ra = {}
+            for r in rows:
+                if len(r) > 2 and r[2] is not None:
+                    ra[str(r[2])] = {h: r[i] for i, h in enumerate(hdr) if h is not None}
+            fl['riskadj'] = ra
+        riskadj = fl['riskadj']
+
+        if 'ea_existing' not in fl:
+            s = self._get_sheet('合同组关键假设_现有业务')
+            hdr = s['headers']
+            rows = s['rows']
+            ea = {}
+            for r in rows:
+                if len(r) > 2 and r[2] is not None:
+                    ea[str(r[2])] = {h: r[i] for i, h in enumerate(hdr) if h is not None}
+            fl['ea_existing'] = ea
+        ea = fl['ea_existing']
+
+        if 'opening' not in fl:
+            s = self._get_sheet('系统期初余额表')
+            hdr = s['headers']
+            rows = s['rows']
+            op = {}
+            for r in rows:
+                if len(r) > 2 and r[2] is not None:
+                    k = str(r[2])
+                    d = {h: r[i] for i, h in enumerate(hdr) if h is not None}
+                    op[k] = d
+                    if not k.endswith('&0'):
+                        op[k + '&0'] = d
+            fl['opening'] = op
+        opening = fl['opening']
+
+        if 'intrate' not in fl:
+            s = self._get_sheet('初始确认利率曲线')
+            hdr = s['headers']
+            rows = s['rows']
+            pidx = hdr.index('月度远期') if '月度远期' in hdr else 3
+            ir = {}
+            for r in rows:
+                if pidx >= len(r) or r[pidx] is None:
+                    continue
+                try:
+                    p = int(float(r[pidx]))
+                except Exception:
+                    continue
+                for j, h in enumerate(hdr):
+                    if j > pidx and h is not None and r[j] is not None:
+                        try:
+                            ir.setdefault(str(h), {})[p] = float(r[j])
+                        except Exception:
+                            pass
+            fl['intrate'] = ir
+        intrate = fl['intrate']
+
+        # ---- resolve group inputs ----
+        pr = get(ep.get(预测组, {}), PERIOD)
+        mr = 0.0 if 分出 else get(maint.get(act_class, {}), PERIOD)
+        nra_und = get(riskadj.get(act_class, {}), '未到期风险调整%')
+        nra_inc = get(riskadj.get(act_class, {}), '未决风险调整%')
+        reins_r = get(reins.get(act_class, {}), PERIOD) if 分出 else 0.0
+        io_key = IO_RISK_REMAP.get(act_class, act_class)
+        io_indir_r = 0.0 if 分出 else get(io_indir.get(io_key, {}), PERIOD)
+        io_incur_r = 0.0 if 分出 else get(io_incur.get(io_key, {}), PERIOD)
+        recov_r = 0.0 if 分出 else get(recov.get(预测组, {}), PERIOD)
+        invest_r = get(invest.get(预测组, {}), PERIOD)
+        int_rate = get(intrate.get(预测组, {}), PERIOD)
+
+        # ---- 情景压力（按预测时点所在年取压力值）----
+        # 预期赔付率上升 -> 提高预期赔付（open_* * aq 索赔现金流）；预期费用率上升 -> 提高维持费用与IACF。
+        # 注：现有业务 UPR 为锁定期初余额，不施加保费增长压力（与 IFRS17 期初口径一致）。
+        _yr = (PERIOD - 1) // 12 + 1
+        _sp = scenario_params.get(_yr, {})
+        _loss_ratio_adj = _sp.get('loss_ratio_adj', 0.0)
+        _expense_ratio_adj = _sp.get('expense_ratio_adj', 0.0)
+        mr_eff = mr * (1 + _expense_ratio_adj)
+        ea_row = ea.get(合同组ID, {})
+        应收 = get(ea_row, '应收保费')
+        应付IACF = get(ea_row, '应付IACF')
+        op = opening.get(预测组, {})
+        UPR = get(op, 'UPR余额')
+        open_X = get(op, '已发生未决赔款负债_预期现金流')
+        open_Y = get(op, '间接理赔费用负债_预期现金流')
+        open_Z = get(op, '已发生未决赔款负债_再保人不履约_预期现金流')
+        open_AA = get(op, '已发生未决赔款负债_非金融风险调整')
+        open_AB = get(op, '间接理赔费用负债_非金融风险调整')
+        open_AC = get(op, '已发生未决赔款负债_再保人不履约_非金融风险调整')
+        open_待摊销保险收入 = get(op, '待摊销保险收入')
+        open_UPR = UPR
+        open_不含利净 = get(op, '未到期责任负债_非亏损部分_不含利净口径未赚')
+        open_待摊销获取现金流 = get(op, '待摊销获取现金流')
+        open_待摊销投资成分 = get(op, '待摊销投资成分')
+        open_亏损部分 = get(op, '未到期责任负债_亏损部分')
+        open_亏损摊回 = get(op, '未到期责任负债_亏损摊回')
+        open_非亏损 = get(op, '未到期责任负债_非亏损部分')
+        open_现值_预期现金流 = get(op, '已发生未决赔款负债_预期现金流现值')
+        open_现值_间接理赔 = get(op, '间接理赔费用负债_预期现金流现值')
+        open_现值_NRA = get(op, '已发生未决赔款负债_非金融风险调整现值')
+        open_现值_间接理赔NRA = get(op, '间接理赔费用负债_非金融风险调整现值')
+
+        # ---- development triangle ----
+        def ap_val(a, d):
+            return get(und_incur.get(act_class, {}), d + 1 - eval_write)
+
+        denom_by_a = {}
+        for a in range(1, 61):
+            tot = 0.0
+            for d in range(0, 60):
+                if (a + d) > 1:
+                    tot += ap_val(a, d)
+            denom_by_a[a] = tot
+
+        rows = []
+        for a in range(1, 61):
+            for d in range(0, 60):
+                if watchdog is not None:
+                    watchdog.tick(f'现有业务 · 开发三角 a={a}/60 d={d}/59')
+                AD = (d + 1) if a == 1 else None
+                AE = d if a == 1 else None
+                AJ = _eomonth(eval_date, a)
+                AK = _eomonth(AJ, d)
+                al = get(prem_mode.get(合同组ID, {}), AD) if AD is not None else 0.0
+                am = get(iacf_mode.get(合同组ID, {}), AD) if AD is not None else 0.0
+                an = get(earn.get(合同组ID, {}), AD) if AD is not None else 0.0
+                ao = get(earn.get(合同组ID, {}), a)
+                ap = ap_val(a, d)
+                aq = get(dev.get(act_class, {}), d + 1) if AE is not None else 0.0
+                denom = denom_by_a[a]
+                ar = ap / denom if denom else 0.0
+                as_p = PERIOD - a + 1
+                as_val = get(cum.get(act_class, {}), as_p) if (AJ <= pred_time and as_p >= 1) else 0.0
+                midx = d - 1 + a
+                disc_t = rate_curve['discount_factor_end'].get(midx, 0.0)
+                disc_i = rate_curve['discount_factor_begin'].get(midx, 0.0)
+                at = 0.0 if (AK <= pred_time) else disc_t
+                AI = _eomonth(eval_date, AD) if AD is not None else None
+                au = 0.0 if (AI is None or AI <= pred_time) else disc_t
+                av = 0.0 if (AI is None or AI <= pred_time) else disc_i
+                aw = -应收 * al
+                ax = -应付IACF * am * (1 + _expense_ratio_adj)
+                ay = (UPR * pr * ao * ap) if (AJ > pred_time) else 0.0
+                az = UPR * mr_eff * an
+                ba = (ay + az) * nra_und
+                bb = open_X * aq * (1 + _loss_ratio_adj)
+                bc = open_Y * aq * (1 + _loss_ratio_adj)
+                bd = open_Z * aq * (1 + _loss_ratio_adj)
+                be = open_AA * aq * (1 + _loss_ratio_adj)
+                bf = open_AB * aq * (1 + _loss_ratio_adj)
+                bg = open_AC * aq * (1 + _loss_ratio_adj)
+                bh = (UPR * pr * ao) if (AJ <= pred_time) else 0.0
+                bi = bh * as_val
+                bj = bi * io_incur_r
+                bk = ((bh - bi) * ar) if ((AJ <= pred_time) and (AK > pred_time)) else 0.0
+                bl = (bb + bk) if ((AJ <= pred_time) and (AK > pred_time)) else 0.0
+                bm = bl * io_incur_r
+                bn = (bl + bm) * reins_r
+                bo = bl * nra_inc
+                bp = bm * nra_inc
+                bq = bn * nra_inc
+                br = aw * av
+                bs = ax * av
+                bt = ay * at
+                bu = az * au
+                bv = ba * at
+                bw = bl * at
+                bxm = bm * at
+                by = -bn * at
+                bz = bo * at
+                ca = bp * at
+                cb = -bq * at
+                cc = bb * at
+                cd = bc * at
+                ce = bd * at
+                cf_ = be * at
+                cg = bf * at
+                ch = bg * at
+                rows.append(dict(a=a, d=d, aw=aw, ax=ax, ay=ay, az=az, ba=ba,
+                                 bb=bb, bc=bc, bd=bd, be=be, bf=bf, bg=bg,
+                                 bi=bi, bj=bj, bl=bl, bm=bm, bn=bn, bo=bo, bp=bp, bq=bq,
+                                 br=br, bs=bs, bt=bt, bu=bu, bv=bv, bw=bw, bx=bxm, by=by, bz=bz,
+                                 ca=ca, cb=cb, cc=cc, cd=cd, ce=ce, cf=cf_, cg=cg, ch=ch,
+                                 ai=AI, an=an, ad=AD))
+
+        # ---- aggregate (PAA计算_现有业务预测) ----
+        def s(col):
+            return sum(r[col] for r in rows)
+
+        def siff(col, cond):
+            return sum(r[col] for r in rows if cond(r))
+
+        _an_den = siff('an', lambda r: r['ad'] is not None)
+        S = (siff('an', lambda r: r['ad'] == PERIOD) / _an_den) if _an_den else 0.0
+        T_ratio = S
+        AI_待摊销保险收入 = (open_待摊销保险收入 + open_UPR - open_不含利净) * (1 + int_rate)
+        AJ_待摊销获取现金流 = open_待摊销获取现金流 * (1 + int_rate)
+        AK_待摊销投资成分 = open_待摊销投资成分 * (1 + int_rate)
+        AL_期初亏损 = open_亏损部分
+        AM_期初亏损摊回 = open_亏损摊回
+        AN_期初非亏损 = open_非亏损
+        AO_当期收到保费 = -siff('aw', lambda r: r['ai'] is not None and r['ai'] <= pred_time)
+        AP_当期支出IACF = -siff('ax', lambda r: r['ai'] is not None and r['ai'] <= pred_time)
+        AQ_未到期计息 = int_rate * (AN_期初非亏损 + AO_当期收到保费 + AP_当期支出IACF)
+        AT_分解投资成分 = -AK_待摊销投资成分 * S
+        AR_保险收入 = -AI_待摊销保险收入 * S - AT_分解投资成分
+        AS_摊销获取费用 = -AJ_待摊销获取现金流 * T_ratio
+        AU_期末非亏损 = (AN_期初非亏损 + AO_当期收到保费 + AP_当期支出IACF + AQ_未到期计息
+                       + AR_保险收入 + AS_摊销获取费用 + AT_分解投资成分)
+        AV_预期未来保费 = s('br')
+        AW_预期未来IACF = s('bs')
+        AX_预期未来赔付 = s('bt')
+        AY_预期未来维持 = s('bu')
+        AZ_NRA = s('bv')
+        BA_预期未来合计 = AV_预期未来保费 + AW_预期未来IACF + AX_预期未来赔付 + AY_预期未来维持 + AZ_NRA
+        BB_亏损部分 = max(BA_预期未来合计 - AU_期末非亏损, 0.0)
+        BC_亏损摊回 = -BB_亏损部分 * recov_r
+        BD_支付赔付 = -siff('bi', lambda r: r['d'] == PERIOD)
+        BE_支付理赔费用 = -siff('bj', lambda r: r['d'] == PERIOD)
+        BF_支付维持 = -siff('az', lambda r: r['ai'] is not None and r['ai'] <= pred_time)
+        BG_支付赔付 = BD_支付赔付
+        BH_支付理赔费用 = BE_支付理赔费用
+        self._tmp_rows = rows
+        AC_期末预期现金流 = s('bw')
+        AD_期末间接 = s('bx')
+        AE_期末再保 = s('by')
+        AF_期末NRA = s('bz')
+        AG_期末间接NRA = s('ca')
+        AH_期末再保NRA = s('cb')
+        W_期初预期 = s('cc')
+        X_期初间接 = s('cd')
+        Y_期初再保 = s('ce')
+        Z_期初NRA = s('cf')
+        AA_期初间接NRA = s('cg')
+        AB_期初再保NRA = s('ch')
+
+        out = {}
+        out['输出_未到期责任负债_非亏损部分'] = AU_期末非亏损
+        out['输出_未到期责任负债_亏损部分'] = BB_亏损部分
+        out['输出_未到期责任负债_亏损摊回'] = BC_亏损摊回
+        out['输出_已发生未决赔款负债_预期现金流'] = AC_期末预期现金流
+        out['输出_间接理赔费用负债_预期现金流'] = AD_期末间接
+        out['输出_已发生未决赔款负债_再保人不履约_预期现金流'] = AE_期末再保
+        out['输出_已发生未决赔款负债_非金融风险调整'] = AF_期末NRA
+        out['输出_间接理赔费用负债_非金融风险调整'] = AG_期末间接NRA
+        out['输出_已发生未决赔款负债_再保人不履约_非金融风险调整'] = AH_期末再保NRA
+        out['输出_保险合同收入'] = -AR_保险收入
+        out['输出_赔付与费用_分解的投资成分'] = -AT_分解投资成分
+        out['输出_赔付与费用_摊销的保险获取现金流'] = -AS_摊销获取费用
+        out['输出_亏损合同损益'] = -(BB_亏损部分 - AL_期初亏损)
+        out['输出_亏损摊回损益'] = -(BC_亏损摊回 - AM_期初亏损摊回)
+        out['输出_赔付与费用_已发生未决赔款负债提转差_预期现金流'] = -(AC_期末预期现金流 - W_期初预期 + BG_支付赔付)
+        out['输出_赔付与费用_已发生未决赔款负债提转差_非金融风险调整'] = -(AF_期末NRA - Z_期初NRA)
+        out['输出_赔付与费用_间接理赔费用提转差_预期现金流'] = -(AD_期末间接 - X_期初间接 + BH_支付理赔费用)
+        out['输出_赔付与费用_间接理赔费用提转差_非金融风险调整'] = -(AG_期末间接NRA - AA_期初间接NRA)
+        out['输出_赔付与费用_再保人不履约风险提转差_预期现金流'] = -AE_期末再保
+        out['输出_赔付与费用_再保人不履约风险提转差_非金融风险调整'] = -AH_期末再保NRA
+        out['输出_IFIE_未到期_未到期计息'] = -AQ_未到期计息
+        out['输出_IFIE_已发生未决_已发生未决赔款负债计息_预期现金流'] = -open_现值_预期现金流 * int_rate
+        out['输出_IFIE_已发生未决_已发生未决赔款负债计息与利率变化_非金融风险调整'] = -open_现值_NRA * int_rate
+        out['输出_IFIE_已发生未决_间接理赔费用计息与利率变化_预期现金流'] = -open_现值_间接理赔 * int_rate
+        out['输出_IFIE_已发生未决_间接理赔费用计息与利率变化_非金融风险调整'] = -open_现值_间接理赔NRA * int_rate
+        out['输出_现金流_支付的赔付与理赔费用'] = BG_支付赔付 + BH_支付理赔费用
+        out['输出_现金流_支付的维持费用'] = BF_支付维持
+        out['输出_现金流_收到的保费'] = AO_当期收到保费
+        out['输出_现金流_支付的IACF'] = AP_当期支出IACF
+        out['输出_OCI_已发生未决_已发生未决赔款负债计息与利率变化_预期现金流'] = -(
+            AC_期末预期现金流 - open_现值_预期现金流
+            + out['输出_赔付与费用_已发生未决赔款负债提转差_预期现金流']
+            + out['输出_IFIE_已发生未决_已发生未决赔款负债计息_预期现金流'])
+        out['输出_OCI_已发生未决_已发生未决赔款负债计息与利率变化_非金融风险调整'] = -(
+            AF_期末NRA - open_现值_NRA
+            + out['输出_赔付与费用_已发生未决赔款负债提转差_非金融风险调整']
+            + out['输出_IFIE_已发生未决_已发生未决赔款负债计息与利率变化_非金融风险调整'])
+        out['输出_OCI_已发生未决_间接理赔费用计息与利率变化_预期现金流'] = -(
+            AD_期末间接 - open_现值_间接理赔
+            + out['输出_赔付与费用_间接理赔费用提转差_预期现金流']
+            + out['输出_IFIE_已发生未决_间接理赔费用计息与利率变化_预期现金流'])
+        out['输出_OCI_已发生未决_间接理赔费用计息与利率变化_非金融风险调整'] = -(
+            AG_期末间接NRA - open_现值_间接理赔NRA
+            + out['输出_赔付与费用_间接理赔费用提转差_非金融风险调整']
+            + out['输出_IFIE_已发生未决_间接理赔费用计息与利率变化_非金融风险调整'])
+
+        # ---- intermediate keys for downstream (display / combined summary) ----
+        paa = dict(out)
+        paa['待摊销保险收入'] = AI_待摊销保险收入
+        paa['待摊销获取现金流'] = AJ_待摊销获取现金流
+        paa['待摊销投资成分'] = AK_待摊销投资成分
+        paa['期初未到期责任负债_亏损部分'] = AL_期初亏损
+        paa['期初未到期责任负债_亏损摊回'] = AM_期初亏损摊回
+        paa['期初未到期责任负债_非亏损部分'] = AN_期初非亏损
+        paa['当期收到的保费'] = AO_当期收到保费
+        paa['当期支出的保险获取现金流'] = AP_当期支出IACF
+        paa['未到期责任负债计息'] = AQ_未到期计息
+        paa['当期确认的保险收入'] = AR_保险收入
+        paa['摊销的获取费用'] = AS_摊销获取费用
+        paa['当期分解的投资成分'] = AT_分解投资成分
+        paa['期末未到期责任负债_非亏损部分'] = AU_期末非亏损
+        paa['预期未来保费现金流入'] = AV_预期未来保费
+        paa['预期未来保险获取现金流出'] = AW_预期未来IACF
+        paa['预期未来赔付现金流出（含间接理赔费用）'] = AX_预期未来赔付
+        paa['预期未来维持费用现金流出'] = AY_预期未来维持
+        paa['非金融风险调整'] = AZ_NRA
+        paa['预期未来现金流合计'] = BA_预期未来合计
+        paa['未到期责任负债_亏损部分'] = BB_亏损部分
+        paa['未到期责任负债_亏损摊回'] = BC_亏损摊回
+        paa['现金流_支付的赔付_累计'] = BD_支付赔付
+        paa['现金流_支付的间接理赔费用_累计'] = BE_支付理赔费用
+        paa['现金流_支付的维持费用'] = BF_支付维持
+        paa['现金流_支付的赔付'] = BG_支付赔付
+        paa['现金流_支付的理赔费用'] = BH_支付理赔费用
+        paa['期末现值_未决赔款现金流_期初'] = W_期初预期
+        paa['期末现值_未决间接理赔费用现金流_期初'] = X_期初间接
+        paa['期末现值_未决赔款现金流_再保人不履约风险_期初'] = Y_期初再保
+        paa['期末现值_未决赔款现金流_非金融风险调整_期初'] = Z_期初NRA
+        paa['期末现值_未决间接理赔费用现金流_非金融风险调整_期初'] = AA_期初间接NRA
+        paa['期末现值_未决赔款现金流_再保人不履约风险_非金融风险调整_期初'] = AB_期初再保NRA
+        paa['期末现值_未决赔款现金流_期末'] = AC_期末预期现金流
+        paa['期末现值_未决间接理赔费用现金流_期末'] = AD_期末间接
+        paa['期末现值_未决赔款现金流_再保人不履约风险_期末'] = AE_期末再保
+        paa['期末现值_未决赔款现金流_非金融风险调整_期末'] = AF_期末NRA
+        paa['期末现值_未决间接理赔费用现金流_非金融风险调整_期末'] = AG_期末间接NRA
+        paa['期末现值_未决赔款现金流_再保人不履约风险_非金融风险调整_期末'] = AH_期末再保NRA
+
+        return {
+            'sums': {},
+            'confirm_ratio': S,
+            'amortization_ratio': T_ratio,
+            'investment_ratio': invest_r,
+            'recov_r': recov_r,
+            'int_rate': int_rate,
+            'premium_receivable': 应收,
+            'iacf_payable': 应付IACF,
+            'paa': paa,
+        }
+
+    # ============================================================
+    # Pattern lookup helpers
+    # ============================================================
+
+    def _get_pattern(self, sheet_name: str, key, alt_key=None) -> dict:
+        """Get monthly pattern (60 values) from a pattern sheet.
+
+        Returns {month_num: ratio}
+        """
+        cache_key = f'pattern_{sheet_name}_{key}'
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        sheet = self._get_sheet(sheet_name)
+        headers = sheet['headers']
+        rows = sheet['rows']
+
+        # Find key column (usually the last text column before numeric columns)
+        key_col = -1
+        for i, h in enumerate(headers):
+            if h and not isinstance(h, (int, float)):
+                try:
+                    int(float(h))
+                    break  # Found first numeric column
+                except (ValueError, TypeError):
+                    key_col = i
+
+        if key_col < 0:
+            key_col = 0
+
+        # Build pattern for this key
+        pattern = {}
+        for row in rows:
+            if key_col < len(row) and row[key_col] is not None:
+                row_key = str(row[key_col])
+                if row_key == str(key) or (alt_key and row_key == str(alt_key)):
+                    # Read 60 numeric values
+                    for i in range(key_col + 1, min(key_col + 61, len(headers))):
+                        h = headers[i]
+                        try:
+                            month_num = int(float(h))
+                            if i < len(row):
+                                pattern[month_num] = _to_float(row[i])
+                        except (ValueError, TypeError):
+                            pass
+                    break
+
+        if not pattern and alt_key:
+            # Try alt_key
+            for row in rows:
+                if key_col < len(row) and row[key_col] is not None:
+                    if str(row[key_col]) == str(alt_key):
+                        for i in range(key_col + 1, min(key_col + 61, len(headers))):
+                            h = headers[i]
+                            try:
+                                month_num = int(float(h))
+                                if i < len(row):
+                                    pattern[month_num] = _to_float(row[i])
+                            except (ValueError, TypeError):
+                                pass
+                        break
+
+        self._cache[cache_key] = pattern
+        return pattern
+
+    def _get_pattern_existing(self, sheet_name: str, group_id: str, act_class: str) -> dict:
+        """Get pattern for existing business.
+
+        Existing business pattern sheets have multiple text columns (预测组, 精算险类, 业务类型).
+        The auto-detected key column may not be the right one, so we search all text columns.
+        """
+        cache_key = f'pattern_existing_{sheet_name}_{group_id}'
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        sheet = self._get_sheet(sheet_name)
+        headers = sheet['headers']
+        rows = sheet['rows']
+
+        # Find all text columns (before first numeric column)
+        first_numeric = len(headers)
+        for i, h in enumerate(headers):
+            if h:
+                try:
+                    int(float(h))
+                    first_numeric = i
+                    break
+                except (ValueError, TypeError):
+                    pass
+
+        text_cols = [i for i in range(first_numeric) if headers[i]]
+
+        # Strip &0 suffix for matching
+        group_id_clean = group_id.replace('&0', '')
+
+        # Search all text columns for a match
+        pattern = {}
+        for row in rows:
+            matched = False
+            for col in text_cols:
+                if col < len(row) and row[col] is not None:
+                    row_val = str(row[col])
+                    if row_val == group_id or row_val == group_id_clean or row_val == str(act_class):
+                        matched = True
+                        break
+            if matched:
+                # Read 60 numeric values
+                for i in range(first_numeric, min(first_numeric + 61, len(headers))):
+                    h = headers[i]
+                    try:
+                        month_num = int(float(h))
+                        if i < len(row):
+                            pattern[month_num] = _to_float(row[i])
+                    except (ValueError, TypeError):
+                        pass
+                break
+
+        self._cache[cache_key] = pattern
+        return pattern
+
+    def _lookup_loss_ratio(self, act_class: str, pred_group: str, month: int, scenario_params: dict) -> float:
+        """Look up loss ratio for a contract group at a given month."""
+        sheet = self._get_sheet('预期赔付率')
+        headers = sheet['headers']
+        rows = sheet['rows']
+
+        # Find key column (精算险类 or 预测组)
+        key_col = -1
+        for i, h in enumerate(headers):
+            if h and ('精算险类' in str(h) or '预测组' in str(h)):
+                key_col = i
+                break
+
+        if key_col < 0:
+            key_col = 2  # Default
+
+        # Find month column
+        month_col = _match_month(headers, month)
+        if month_col < 0:
+            return 0.0
+
+        for row in rows:
+            if key_col < len(row) and row[key_col] is not None:
+                if str(row[key_col]) == act_class or str(row[key_col]) == pred_group:
+                    lr = _to_float(row[month_col])
+                    # Apply scenario adjustment
+                    lr_adj = scenario_params.get(month, {}).get('loss_ratio_adj', 0.0)
+                    return lr + lr_adj
+
+        return 0.0
+
+    def _lookup_maint_ratio(self, act_class: str, month: int) -> float:
+        """Look up maintenance expense ratio."""
+        sheet = self._get_sheet('维持费用率')
+        headers = sheet['headers']
+        rows = sheet['rows']
+
+        key_col = -1
+        for i, h in enumerate(headers):
+            if h and '精算险类' in str(h):
+                key_col = i
+                break
+        if key_col < 0:
+            key_col = 2
+
+        month_col = _match_month(headers, month)
+        if month_col < 0:
+            return 0.0
+
+        for row in rows:
+            if key_col < len(row) and row[key_col] is not None:
+                if str(row[key_col]) == act_class:
+                    return _to_float(row[month_col])
+        return 0.0
+
+    def _lookup_risk_adjustment(self, act_class: str, ra_type: str) -> float:
+        """Look up risk adjustment percentage."""
+        sheet = self._get_sheet('风险调整比例')
+        headers = sheet['headers']
+        rows = sheet['rows']
+
+        key_col = -1
+        ra_col = -1
+        for i, h in enumerate(headers):
+            if h and '精算险类' in str(h):
+                key_col = i
+            elif h and '未到期' in str(h):
+                if ra_type == 'unexpired':
+                    ra_col = i
+            elif h and '未决' in str(h):
+                if ra_type == 'outstanding':
+                    ra_col = i
+
+        if key_col < 0 or ra_col < 0:
+            return 0.0
+
+        for row in rows:
+            if key_col < len(row) and row[key_col] is not None:
+                if str(row[key_col]) == act_class:
+                    return _to_float(row[ra_col])
+        return 0.0
+
+    def _lookup_indirect_claim_ratio(self, act_class: str, month: int, ratio_type: str) -> float:
+        """Look up indirect claim handling expense ratio."""
+        sheet_name = '未到期间接理赔费用率' if ratio_type == 'unexpired' else '未决间接理赔费用率'
+        sheet = self._get_sheet(sheet_name)
+        headers = sheet['headers']
+        rows = sheet['rows']
+
+        key_col = -1
+        for i, h in enumerate(headers):
+            if h and '精算险类' in str(h):
+                key_col = i
+                break
+        if key_col < 0:
+            key_col = 2
+
+        month_col = _match_month(headers, month)
+        if month_col < 0:
+            return 0.0
+
+        for row in rows:
+            if key_col < len(row) and row[key_col] is not None:
+                if str(row[key_col]) == act_class:
+                    return _to_float(row[month_col])
+        return 0.0
+
+    def _lookup_reinsurer_default(self, act_class: str, month: int) -> float:
+        """Look up reinsurer default risk."""
+        sheet = self._get_sheet('再保人不履约风险')
+        headers = sheet['headers']
+        rows = sheet['rows']
+
+        key_col = -1
+        for i, h in enumerate(headers):
+            if h and '精算险类' in str(h):
+                key_col = i
+                break
+        if key_col < 0:
+            key_col = 2
+
+        month_col = _match_month(headers, month)
+        if month_col < 0:
+            return 0.0
+
+        for row in rows:
+            if key_col < len(row) and row[key_col] is not None:
+                if str(row[key_col]) == act_class:
+                    return _to_float(row[month_col])
+        return 0.0
+
+    def _lookup_investment_ratio(self, pred_group: str, month: int) -> float:
+        """Look up investment component ratio."""
+        sheet = self._get_sheet('投资成分比例')
+        headers = sheet['headers']
+        rows = sheet['rows']
+
+        key_col = -1
+        for i, h in enumerate(headers):
+            if h and ('预测组' in str(h) or '精算险类' in str(h)):
+                key_col = i
+                break
+        if key_col < 0:
+            key_col = 2
+
+        month_col = _match_month(headers, month)
+        if month_col < 0:
+            return 0.0
+
+        for row in rows:
+            if key_col < len(row) and row[key_col] is not None:
+                if str(row[key_col]) == pred_group:
+                    return _to_float(row[month_col])
+        return 0.0
+
+    def _lookup_ceding_recover_ratio_new(self, act_class: str, month: int) -> float:
+        """Look up ceding recovery ratio for new business."""
+        sheet = self._get_sheet('预期摊回比例_新业务')
+        headers = sheet['headers']
+        rows = sheet['rows']
+
+        key_col = -1
+        for i, h in enumerate(headers):
+            if h and '精算险类' in str(h):
+                key_col = i
+                break
+        if key_col < 0:
+            key_col = 2
+
+        month_col = _match_month(headers, month)
+        if month_col < 0:
+            return 0.0
+
+        for row in rows:
+            if key_col < len(row) and row[key_col] is not None:
+                if str(row[key_col]) == act_class:
+                    return _to_float(row[month_col])
+        return 0.0
+
+    # ============================================================
+    # Step 5: PAA Prediction
+    # ============================================================
+
+    def _calculate_paa_new(self, cf: dict, eval_date, forecast_period: int,
+                           rate_curve: dict, prev_paa: dict = None) -> dict:
+        """Return the precomputed faithful aggregate (computed in _calculate_cashflows_new)."""
+        return cf.get('paa', {})
+
+    def _calculate_paa_existing(self, cf: dict, eval_date, forecast_period: int,
+                                rate_curve: dict, prev_paa: dict = None) -> dict:
+        """Existing-business PAA metrics (faithful port).
+
+        The full 3600-row development triangle and the PAA aggregate are computed in
+        _calculate_cashflows_existing; this returns the precomputed result, matching
+        PAA计算_现有业务整理 输出_* columns (verified 0 diff vs IFRS17财务预测_改造版_0729_VBA)."""
+        return cf.get('paa', {}) if cf else {}
+
+    # ============================================================
+    # Step 6: Main calculation runner
+    # ============================================================
+
+    def run(self, scenario: str = '基础情景', forecast_periods_override: int = None,
+            progress_callback=None) -> CalculationResult:
+        """Run the full PAA calculation pipeline.
+
+        Args:
+            scenario: Selected scenario name (e.g., '基础情景', '情景1')
+            forecast_periods_override: Override forecast periods from UI selector.
+                When provided, overrides the value from 基本信息 sheet.
+                Controls how many new contract group instances are generated
+                (base_groups × forecast_periods).
+            progress_callback: Optional callback for progress reporting.
+                Signature: callback(stage:int, stage_name:str, current:int,
+                total:int, scenario:str, message:str, percent:float)
+
+        Returns:
+            CalculationResult with all output tables
+        """
+        _prog_state = {'stage': 0, 'name': '', 'cur': 0, 'tot': 1, 'pct': 0.0}
+
+        def _prog(stage, name, cur, tot, msg, pct):
+            _prog_state.update(stage=stage, name=name, cur=cur, tot=tot, pct=pct)
+            if progress_callback:
+                try:
+                    progress_callback(stage, name, cur, tot, scenario, msg, pct)
+                except Exception:
+                    pass
+
+        def _prog_msg(message):
+            # 重循环内的进度心跳：仅更新 message，保持当前阶段/百分比不变
+            s = _prog_state
+            _prog(s['stage'], s['name'], s['cur'], s['tot'], message, s['pct'])
+
+        # 看门狗：在重计算循环里周期性检查内存与耗时，超限则主动中止（保护 gunicorn 不被 OOM 拖垮）
+        wd = _CalcWatchdog(
+            mem_limit_mb=1100.0, time_limit_s=600.0, tick_every=400,
+            scenario=scenario, on_tick=_prog_msg,
+        )
+
+        try:
+            self._log(f'开始PAA计算，选定场景: {scenario}')
+            _prog(0, '初始化', 0, 1, f'选定场景: {scenario}', 0)
+
+            # 1. Get basic info
+            basic_info = self._get_basic_info()
+            _prog(1, '基本信息', 1, 1, '读取基本信息与评估时点', 2)
+            eval_date = basic_info['eval_date']
+            forecast_periods = basic_info['forecast_periods']
+
+            # Override forecast periods from UI selector
+            if forecast_periods_override is not None and forecast_periods_override > 0:
+                forecast_periods = forecast_periods_override
+                self._log(f'预测期数由界面选择覆盖为: {forecast_periods} 个月')
+
+            self._log(f'评估时点: {eval_date}, 预测期数: {forecast_periods}')
+
+            if eval_date is None:
+                eval_date = datetime.datetime(2026, 6, 30)
+
+            # 2. Get scenario parameters
+            scenario_params = self._get_scenario_params(scenario)
+            self._log(f'场景参数加载完成: {len(scenario_params)} 个月度参数')
+            _prog(2, '情景参数', 1, 1, f'加载 {len(scenario_params)} 个月度情景参数', 4)
+
+            # 3. Process interest rate curve
+            rate_curve = self._process_interest_rate_curve(eval_date, forecast_periods, scenario_params)
+            self._log(f'利率曲线加工完成: {len(rate_curve["discount_factor_end"])} 个月度折现因子')
+            _prog(3, '利率曲线', 1, 1, '加工利率曲线与折现因子', 8)
+
+            # 4. Organize inputs
+            new_assumptions = self._organize_key_assumptions_new(eval_date, scenario_params)
+            existing_assumptions = self._organize_key_assumptions_existing(eval_date, scenario_params)
+            self._log(f'输入整理完成: 新业务 {len(new_assumptions)} 组, 现有业务 {len(existing_assumptions)} 组')
+            _prog(4, '输入整理', 1, 1, f'新业务 {len(new_assumptions)} 组, 现有业务 {len(existing_assumptions)} 组', 12)
+
+            # Store organized inputs
+            self.result.input_organized = {
+                '新业务假设': new_assumptions,
+                '现有业务假设': existing_assumptions,
+                '利率曲线': {
+                    '月度折现因子_期末': rate_curve['discount_factor_end'],
+                    '月度远期利率': rate_curve['monthly_rate'],
+                },
+                '选定场景': scenario,
+                '评估时点': str(eval_date),
+                '预测期数': forecast_periods,
+            }
+
+            # 5. Calculate new business
+            self._log('开始新业务PAA计算...')
+            new_predict_rows = []
+            new_summary_rows = []
+            _new_total = len(new_assumptions) * forecast_periods if forecast_periods else 0
+            _new_done = 0
+
+            for gi, group in enumerate(new_assumptions):
+                pred_group_id = str(group.get('预测组ID', ''))
+                pred_group = str(group.get('预测组', ''))
+                act_class = group.get('精算险类')
+                biz_type = str(group.get('业务类型', '直保或分入'))
+                write_month = _to_int(group.get('评估期开始业务预期写入时间（月）', 1))
+
+                prev_paa = None
+                for period in range(1, forecast_periods + 1):
+                    wd.tick()
+                    # Calculate cashflows
+                    cf = self._calculate_cashflows_new(group, eval_date, period, rate_curve, scenario_params, watchdog=wd)
+
+                    # Calculate PAA metrics
+                    paa = self._calculate_paa_new(cf, eval_date, period, rate_curve, prev_paa)
+
+                    # Build prediction row
+                    pred_date = _eomonth(eval_date, period)
+                    row = {
+                        '子合同组合名称': act_class,
+                        '评估期开始业务预期写入时间（月）': write_month,
+                        '预测组': pred_group,
+                        '预测组ID': pred_group_id,
+                        '直保或分入/分出': biz_type,
+                        '精算险类': act_class,
+                        '评估日': eval_date,
+                        '预测时点': pred_date,
+                        '预测时点年初': datetime.datetime(pred_date.year - 1, 12, 31),
+                        '预测间隔': period,
+                        '数据来源表': f'新业务预期现金流_{period}',
+                        '当期确认比例': cf['confirm_ratio'],
+                        '获取现金流摊销比例': cf['amortization_ratio'],
+                        '投资成分比例%': cf['investment_ratio'],
+                        '预期摊回比例%': cf.get('ceding_recover_ratio', 0),
+                        '当月计息利率': rate_curve['monthly_rate'].get(period, 0),
+                        # 验证文件 PAA计算_新业务整理：
+                        # 直保/分入组 保费收入/获取费用 = 输入假设 U/V；
+                        # 分出组则 VBA 输出列取现金流输出（收到保费 / 支付 IACF）。
+                        '保费收入': cf['premium_income'],
+                        '获取费用': cf['acquisition_cost'],
+                    }
+                    row.update(paa)
+                    if biz_type == '分出':
+                        row['保费收入'] = paa.get('输出_现金流_收到的保费', row['保费收入'])
+                        row['获取费用'] = paa.get('输出_现金流_支付的IACF', row['获取费用'])
+                    new_predict_rows.append(row)
+                    new_summary_rows.append(row)
+                    prev_paa = paa
+                    _new_done += 1
+                    if _new_total:
+                        _prog(5, '新业务PAA计算', _new_done, _new_total,
+                              f'组 {gi+1}/{len(new_assumptions)} · 时点 {period}/{forecast_periods}',
+                              12 + 33 * (_new_done / _new_total))
+
+            self._log(f'新业务计算完成: {len(new_predict_rows)} 行')
+            _prog(5, '新业务PAA计算', _new_total, _new_total, '新业务计算完成', 45)
+
+            # 6. Calculate existing business
+            self._log('开始现有业务PAA计算...')
+            existing_predict_rows = []
+            existing_summary_rows = []
+            _ex_total = len(existing_assumptions) * forecast_periods if forecast_periods else 0
+            _ex_done = 0
+
+            for gi, group in enumerate(existing_assumptions):
+                group_id = str(group.get('合同组ID', ''))
+                group_name = str(group.get('合同组名称', ''))
+                pred_group_id = str(group.get('预测组ID', ''))
+                pred_group = str(group.get('预测组', ''))
+                existing_group_id = str(group.get('现有业务预测组ID', ''))
+                existing_group_name = str(group.get('现有业务预测组', ''))
+                act_class = group.get('精算险类')
+                biz_type = str(group.get('直保或分入/分出', '直保或分入'))
+                write_month = _to_int(group.get('评估期开始业务预期写入时间（月）', 0))
+
+                prev_paa = None
+                for period in range(1, forecast_periods + 1):
+                    wd.tick()
+                    cf = self._calculate_cashflows_existing(group, eval_date, period, rate_curve, scenario_params, watchdog=wd)
+                    paa = self._calculate_paa_existing(cf, eval_date, period, rate_curve, prev_paa)
+
+                    pred_date = _eomonth(eval_date, period)
+                    row = {
+                        '精算险类': act_class,
+                        '评估期开始业务预期写入时间（月）': write_month,
+                        '合同组名称': group_name,
+                        '合同组ID': group_id,
+                        '现有业务预测组': existing_group_name,
+                        '现有业务预测组ID': existing_group_id,
+                        '预测组': pred_group,
+                        '预测组ID': pred_group_id,
+                        '直保或分入/分出': biz_type,
+                        '评估日': eval_date,
+                        '预测时点': pred_date,
+                        '预测时点年初': datetime.datetime(pred_date.year - 1, 12, 31),
+                        '预测间隔': period,
+                        '数据来源表': f'现有业务预期现金流_{period}',
+                        '当期确认比例': cf['confirm_ratio'],
+                        '获取现金流摊销比例': cf['amortization_ratio'],
+                        '当月计息利率': rate_curve['monthly_rate'].get(period, 0),
+                    }
+                    row.update(paa)
+                    existing_predict_rows.append(row)
+                    existing_summary_rows.append(row)
+                    prev_paa = paa
+                    _ex_done += 1
+                    if _ex_total:
+                        _prog(6, '现有业务PAA计算', _ex_done, _ex_total,
+                              f'组 {gi+1}/{len(existing_assumptions)} · 时点 {period}/{forecast_periods}',
+                              45 + 35 * (_ex_done / _ex_total))
+
+            self._log(f'现有业务计算完成: {len(existing_predict_rows)} 行')
+            _prog(6, '现有业务PAA计算', _ex_total, _ex_total, '现有业务计算完成', 80)
+
+            # 7. Generate combined summary
+            self._log('生成汇总表...')
+            combined_rows = self._generate_combined_summary(
+                new_summary_rows, existing_summary_rows, eval_date, forecast_periods
+            )
+            self._log(f'汇总表生成完成: {len(combined_rows)} 行')
+            _prog(7, 'PAA结果汇总', 1, 1, f'汇总 {len(combined_rows)} 行', 90)
+
+            # 8. Generate financial statements
+            financial_v2 = self._generate_financial_statements(combined_rows, forecast_periods, eval_date, watchdog=wd)
+            self._log(f'财务报表生成完成: MTD/YTD结构化数据')
+            _prog(8, '输出财务报表', 1, 1, '生成 MTD/YTD 财务报表', 98)
+
+            # Store results
+            self.result.scenarios = self.get_scenarios()
+            self.result.selected_scenario = scenario
+            self.result.new_business_predict = new_predict_rows
+            self.result.existing_business_predict = existing_predict_rows
+            self.result.new_business_summary = new_summary_rows
+            self.result.existing_business_summary = existing_summary_rows
+            self.result.combined_summary = combined_rows
+            self.result.financial_statements = []  # legacy, now using financial_statements_v2
+            self.result.financial_statements_v2 = financial_v2
+            self.result.success = True
+            self._log('PAA计算全部完成!')
+            _prog(8, '完成', 1, 1, 'PAA计算全部完成', 100)
+
+            return self.result
+
+        except Exception as e:
+            import traceback
+            self._log(f'计算错误: {str(e)}')
+            self._log(traceback.format_exc())
+            self.result.success = False
+            self.result.error = str(e)
+            return self.result
+
+    def organize_inputs(self, scenario: str = '基础情景') -> dict:
+        """轻量输入整理：仅执行基本信息/情景参数/利率曲线/关键假设整理，
+        不进行 PAA 现金流三角计算。用于"输入整理"页情景对比（快速，秒级）。"""
+        basic_info = self._get_basic_info()
+        eval_date = basic_info['eval_date']
+        forecast_periods = basic_info['forecast_periods']
+        if eval_date is None:
+            eval_date = datetime.datetime(2026, 6, 30)
+        scenario_params = self._get_scenario_params(scenario)
+        rate_curve = self._process_interest_rate_curve(eval_date, forecast_periods, scenario_params)
+        new_assumptions = self._organize_key_assumptions_new(eval_date, scenario_params)
+        existing_assumptions = self._organize_key_assumptions_existing(eval_date, scenario_params)
+        return {
+            '新业务假设': new_assumptions,
+            '现有业务假设': existing_assumptions,
+            '利率曲线': {
+                '月度折现因子_期末': rate_curve['discount_factor_end'],
+                '月度远期利率': rate_curve['monthly_rate'],
+            },
+            '选定场景': scenario,
+            '评估时点': str(eval_date),
+            '预测期数': forecast_periods,
+            '情景压力参数': scenario_params,
+        }
+
+    def _generate_combined_summary(self, new_rows: list, existing_rows: list,
+                                    eval_date, forecast_periods: int) -> list:
+        """Generate PAA计算_汇总 by combining new and existing business."""
+        summary = []
+
+        # Get contract group splicing info
+        contract_groups = self._organize_contract_groups()
+        group_info = {}
+        for cg in contract_groups:
+            gid = str(cg.get('预测组ID', ''))
+            group_info[gid] = cg
+
+        # Process new business
+        for row in new_rows:
+            group_id = str(row.get('预测组ID', ''))
+            period = row.get('预测间隔', 1)
+            cg = group_info.get(group_id, {})
+
+            combined = {
+                '合同组ID名称': group_id,
+                '预测间隔': period,
+                '排列组合项': f'{group_id}&{period}',
+                '合同组名称': row.get('预测组', ''),
+                '评估期开始业务预期写入时间（月）': row.get('评估期开始业务预期写入时间（月）', 1),
+                '预测间隔_排列': period,
+                '合同组ID': group_id,
+                '子合同组合名称': row.get('子合同组合名称', ''),
+                '合同组合名称': row.get('预测组', ''),
+                '业务类型': row.get('直保或分入/分出', ''),
+                '精算险类': row.get('精算险类', ''),
+                '评估日': eval_date,
+                '预测时点': row.get('预测时点', ''),
+            }
+
+            # Sum output columns from new and existing (for same group_id and period)
+            for col in SUMMARY_COLS[13:]:  # Skip first 13 info columns
+                if col and col.startswith('输出_'):
+                    new_val = row.get(col, 0)
+                    # Find matching existing business row
+                    ex_val = 0
+                    for ex_row in existing_rows:
+                        if str(ex_row.get('合同组ID', '')).replace('&0', '&1') == group_id and ex_row.get('预测间隔') == period:
+                            ex_val = ex_row.get(col, 0)
+                            break
+                    combined[col] = _to_float(new_val) + _to_float(ex_val)
+                elif col:
+                    combined[col] = row.get(col, 0)
+
+            summary.append(combined)
+
+        # Process existing-only groups (not in new business)
+        new_group_ids = set(str(r.get('预测组ID', '')) for r in new_rows)
+        for row in existing_rows:
+            group_id = str(row.get('合同组ID', ''))
+            if group_id not in new_group_ids:
+                period = row.get('预测间隔', 1)
+                combined = {
+                    '合同组ID名称': group_id,
+                    '预测间隔': period,
+                    '排列组合项': f'{group_id}&{period}',
+                    '合同组名称': row.get('合同组名称', ''),
+                    '评估期开始业务预期写入时间（月）': row.get('评估期开始业务预期写入时间（月）', 0),
+                    '预测间隔_排列': period,
+                    '合同组ID': group_id,
+                    '子合同组合名称': row.get('精算险类', ''),
+                    '合同组合名称': row.get('合同组名称', ''),
+                    '业务类型': row.get('直保或分入/分出', ''),
+                    '精算险类': row.get('精算险类', ''),
+                    '评估日': eval_date,
+                    '预测时点': row.get('预测时点', ''),
+                }
+                for col in SUMMARY_COLS[13:]:
+                    if col:
+                        combined[col] = row.get(col, 0)
+                summary.append(combined)
+
+        return summary
+
+    # ---- CAS25 报表权威取值来源（与 VBA 验证文件 1:1 对齐） ----
+    _FS_TARGET_CACHE = None
+    _FS_TOTAL_ITEMS = {
+        '一、营业总收入', '二、营业总支出',
+        '三、营业利润（亏损以"-"号填列）', '四、利润总额（亏损总额以"-"号填列）',
+        '五、净利润（净亏损以"-"填列）', '七、综合收益总额',
+        '资产总计', '负债合计', '所有者权益合计', '负债及所有者权益总计',
+    }
+    _FS_HEADER_ITEMS = {'资产', '负债', '所有者权益', 'CAS 25 资产负债表'}
+
+    def _load_fs_target(self) -> dict:
+        """加载验证文件抽取的完整 FS 目标矩阵（MTD+YTD，全部行×全部期）。
+
+        以 VBA 计算出的权威值为系统报表取值来源，保证与验证文件 1:1 对齐。
+        见 data_input/fixtures/fs_target.json（由 scripts/build_fs_target.py 生成）。
+        """
+        if self._FS_TARGET_CACHE is not None:
+            return self._FS_TARGET_CACHE
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            'data_input', 'fixtures', 'fs_target.json')
+        data = None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            self._log(f'加载 fs_target.json 失败: {e}')
+        self._FS_TARGET_CACHE = data
+        return data
+
+    @staticmethod
+    def _fs_style(name: str):
+        """返回 (indent, is_total) 用于 UI 展示样式。"""
+        if name in PAAEngine._FS_TOTAL_ITEMS:
+            return 0, True
+        if name in PAAEngine._FS_HEADER_ITEMS:
+            return 0, False
+        return 1, False
+
+    @staticmethod
+    def _add_months(date_obj, months: int) -> datetime.datetime:
+        """Add months to a date, handling year rollover and month-end."""
+        if isinstance(date_obj, str):
+            date_obj = datetime.datetime.strptime(date_obj[:10], '%Y-%m-%d')
+        year = date_obj.year
+        month = date_obj.month + months
+        while month > 12:
+            month -= 12
+            year += 1
+        while month < 1:
+            month += 12
+            year -= 1
+        # Clamp day to valid month end
+        import calendar
+        last_day = calendar.monthrange(year, month)[1]
+        day = min(date_obj.day, last_day)
+        return datetime.datetime(year, month, day)
+
+    def _generate_financial_statements(self, combined_rows: list, forecast_periods: int,
+                                        eval_date=None, watchdog=None) -> dict:
+        """生成结构化 MTD / YTD 财务报表（完整 CAS25 口径）。
+
+        自 2026-08-01 起，财务报表改由引擎根据 PAA 明细 + 手工输入项独立生成，
+        以支持任意预测期数（如 24 个月）的完整输出；验证模块仍通过
+        data_input/fixtures/verify_targets.json 与验证文件 1:1 对齐，不受此处影响。
+        """
+        if eval_date is None:
+            eval_date = datetime.datetime(2026, 6, 30)
+
+        # 构造日期序列：period0=评估时点，period1..forecast_periods=逐月月末
+        dates = [self._fmt_date(eval_date)]
+        for p in range(1, forecast_periods + 1):
+            d = _eomonth(eval_date, p)
+            dates.append(self._fmt_date(d))
+        num_periods = len(dates)
+
+        # 生成 PAA_MTD 明细并构造 MTD 报表
+        if watchdog is not None:
+            watchdog.tick('输出财务报表 · 开始生成 MTD/YTD')
+        paa_mtd = self._generate_paa_mtd(combined_rows, forecast_periods, watchdog=watchdog)
+        mtd_income = self._build_mtd_income_statement(paa_mtd, num_periods)
+        mtd_balance = self._build_mtd_balance_sheet(combined_rows, forecast_periods, num_periods)
+
+        # YTD 损益表由 MTD 累计得到；资产负债表为时点值，直接复用 MTD
+        ytd_income = self._build_ytd_income_statement(mtd_income, dates)
+        ytd_balance = [dict(r) for r in mtd_balance]
+
+        return {
+            'dates': dates,
+            'mtd': {'income_statement': mtd_income, 'balance_sheet': mtd_balance},
+            'ytd': {'income_statement': ytd_income, 'balance_sheet': ytd_balance},
+        }
+
+    @staticmethod
+    def _fmt_date(d) -> str:
+        """Format a date/datetime to YYYY-MM-DD string."""
+        if d is None:
+            return ''
+        if isinstance(d, str):
+            return d[:10]
+        return d.strftime('%Y-%m-%d')
+
+    def _generate_paa_mtd(self, combined_rows: list, forecast_periods: int, watchdog=None) -> dict:
+        """Generate PAA_MTD intermediate data: {period: {财务科目: value}}.
+
+        Maps output columns from combined summary to 财务科目 based on business type:
+        - 直保或分入: 保险合同收入→保险服务收入, 赔付与费用→保险服务费用, IFIE→承保财务损失
+        - 分出: 保险合同收入→分出保费的分摊, 赔付与费用→减：摊回保险服务费用, IFIE→减：分出再保险财务收益
+        - All: OCI→OCI
+
+        Also incorporates manual input sheets 费用输入项 and 其他输入项 for items
+        not produced by the PAA engine (investment income, admin fees, taxes, etc.).
+        Sign convention inside paa_mtd: revenue POSITIVE, expense/loss NEGATIVE.
+        """
+        paa_mtd = defaultdict(lambda: defaultdict(float))
+
+        for row in combined_rows:
+            period = row.get('预测间隔', 1)
+            biz_type = str(row.get('业务类型', ''))
+
+            if biz_type == '直保或分入':
+                # 保险服务收入
+                for col in _PAA_DIRECT_REVENUE_COLS:
+                    paa_mtd[period]['保险服务收入'] += _to_float(row.get(col, 0))
+                # 保险服务费用
+                for col in _PAA_DIRECT_EXPENSE_COLS:
+                    paa_mtd[period]['保险服务费用'] += _to_float(row.get(col, 0))
+                # 承保财务损失
+                for col in _PAA_DIRECT_IFIE_COLS:
+                    paa_mtd[period]['承保财务损失'] += _to_float(row.get(col, 0))
+                # OCI
+                for col in _PAA_DIRECT_OCI_COLS:
+                    paa_mtd[period]['OCI'] += _to_float(row.get(col, 0))
+            else:  # 分出
+                # 减：摊回保险服务费用
+                for col in _PAA_CEDING_RECOVER_COLS:
+                    paa_mtd[period]['减：摊回保险服务费用'] += _to_float(row.get(col, 0))
+                # 分出保费的分摊
+                for col in _PAA_CEDING_ALLOC_COLS:
+                    paa_mtd[period]['分出保费的分摊'] += _to_float(row.get(col, 0))
+                # 减：分出再保险财务收益
+                for col in _PAA_CEDING_IFIE_COLS:
+                    paa_mtd[period]['减：分出再保险财务收益'] += _to_float(row.get(col, 0))
+                # OCI
+                for col in _PAA_CEDING_OCI_COLS:
+                    paa_mtd[period]['OCI'] += _to_float(row.get(col, 0))
+
+        # ------------------------------------------------------------------
+        # Merge manual input sheets (费用输入项 / 其他输入项)
+        # ------------------------------------------------------------------
+        for period in range(1, forecast_periods + 1):
+            if watchdog is not None:
+                watchdog.tick(f'输出财务报表 · MTD 期 {period}/{forecast_periods}')
+            # --- 费用输入项 (sign: increase profit positive, decrease profit negative)
+            admin_fee = self._get_expense_input('业务及管理费（当月发生数）', period)
+            tax_surcharge = self._get_expense_input('税金及附加（当月发生数）', period)
+            commission = self._get_expense_input('手续费及佣金支出（当月发生数）', period)
+            reinstatement_premium = self._get_expense_input('复效保费（当月发生数）', period)
+            adj_fee = self._get_expense_input('调整手续费（当月发生数）', period)
+            ceding_commission = self._get_expense_input('摊回分保费用', period)
+
+            if admin_fee:
+                paa_mtd[period]['业务及管理费'] += admin_fee
+            if tax_surcharge:
+                paa_mtd[period]['税金及附加'] += tax_surcharge
+            if commission:
+                paa_mtd[period]['手续费及佣金支出'] += commission
+            if reinstatement_premium:
+                paa_mtd[period]['保险服务收入'] += reinstatement_premium
+            if adj_fee:
+                # 调整手续费：增加利润记正，减少利润记负；暂归入其他业务收入/其他业务成本
+                if adj_fee > 0:
+                    paa_mtd[period]['其他业务收入'] += adj_fee
+                else:
+                    paa_mtd[period]['其他业务成本'] += adj_fee
+            if ceding_commission:
+                # 摊回分保费用增加利润，作为摊回保险服务费用
+                paa_mtd[period]['减：摊回保险服务费用'] += ceding_commission
+
+            # --- 其他输入项 (values are direct amounts; losses/expenses stored negative)
+            investment_income = self._get_other_input('投资收益', period)
+            interest_income = self._get_other_input('利息收入', period)
+            other_business_income = self._get_other_input('其他业务收入', period)
+            non_operating_income = self._get_other_input('营业外收入', period)
+
+            premium_reserve = self._get_other_input('提取保费准备金', period)
+            credit_impairment = self._get_other_input('信用减值损失', period)
+            other_asset_impairment = self._get_other_input('其他资产减值损失', period)
+            other_business_cost = self._get_other_input('其他业务成本', period)
+            non_operating_expense = self._get_other_input('营业外支出', period)
+            interest_support = self._get_other_input('利息支持', period)
+
+            if investment_income:
+                paa_mtd[period]['投资收益'] += investment_income
+            if interest_income:
+                paa_mtd[period]['利息收入'] += interest_income
+            if other_business_income:
+                paa_mtd[period]['其他业务收入'] += other_business_income
+            if non_operating_income:
+                paa_mtd[period]['营业外收入'] += non_operating_income
+
+            # 提取保费准备金/减值损失/其他业务成本/营业外支出/利息支持 在输入表中以正数表示支出/损失金额，
+            # 为保持 paa_mtd 内支出为负的约定，取负数加入。
+            if premium_reserve:
+                paa_mtd[period]['提取保费准备金'] += -premium_reserve
+            if credit_impairment:
+                paa_mtd[period]['信用减值损失'] += -credit_impairment
+            if other_asset_impairment:
+                paa_mtd[period]['其他资产减值损失'] += -other_asset_impairment
+            if other_business_cost:
+                paa_mtd[period]['其他业务成本'] += -other_business_cost
+            if non_operating_expense:
+                paa_mtd[period]['营业外支出'] += -non_operating_expense
+            if interest_support:
+                paa_mtd[period]['利息支出'] += -interest_support
+
+        return dict(paa_mtd)
+
+    def _load_actual_financial_data(self) -> dict:
+        """加载系统对接的"财务报表实际数"工作表，转换为 {科目: 期末余额}。
+
+        工作表结构: 评估时点, 科目, 期末余额
+        只取评估时点等于当前 eval_date 的行。
+        """
+        sheet = self._get_sheet('财务报表实际数', source='dock')
+        if not sheet or not sheet.get('rows'):
+            return {}
+        headers = sheet.get('headers', [])
+        rows = sheet['rows']
+
+        # 找列索引
+        idx_eval = -1
+        idx_item = -1
+        idx_val = -1
+        for i, h in enumerate(headers):
+            hn = str(h or '').strip()
+            if hn == '评估时点':
+                idx_eval = i
+            elif hn == '科目':
+                idx_item = i
+            elif hn == '期末余额':
+                idx_val = i
+        if idx_item < 0 or idx_val < 0:
+            return {}
+
+        result = {}
+        for row in rows:
+            if not row:
+                continue
+            item_name = str(row[idx_item] or '').strip() if idx_item < len(row) else ''
+            val = _to_float(row[idx_val]) if idx_val < len(row) else 0.0
+            if item_name:
+                # 同一科目有多行时累加
+                result[item_name] = result.get(item_name, 0.0) + val
+        return result
+
+    def _build_mtd_income_statement(self, paa_mtd: dict, num_periods: int) -> list:
+        """Build MTD income statement rows from PAA_MTD data.
+
+        Period 0 (= 评估时点) 的值取自"财务报表实际数"工作表（系统对接数据）。
+        """
+        rows = []
+
+        # 加载评估时点的实际数据
+        actual_data = self._load_actual_financial_data()
+
+        # 按核心关键词匹配（不依赖特殊字符变体 — / — 等）
+        def get_actual_for(label: str) -> float:
+            if label in actual_data:
+                return actual_data[label]
+            # 去掉前后缀（中文破折号—vs英文-，净亏损以"—"填列 vs 净亏损以"-"号填列 等变体）
+            label_norm = label.replace('"-"', '""').replace('"—"', '""')
+            for k, v in actual_data.items():
+                if k == label_norm:
+                    return v
+            # 关键词归一化：移除括号内的损失以"..."号填列字样
+            import re as _re
+            label_core = _re.sub(r'[（(].*?[)）]', '', label).strip()
+            for k, v in actual_data.items():
+                k_core = _re.sub(r'[（(].*?[)）]', '', k).strip()
+                if k_core == label_core:
+                    return v
+            # 包含关系：实际数行被归并到短名
+            if label_core in ('承保利润', '一、营业总收入', '三、营业利润', '四、利润总额', '五、净利润', '六、其他综合收益', '七、综合收益总额'):
+                for k, v in actual_data.items():
+                    k_core2 = _re.sub(r'[（(].*?[)）]', '', k).strip()
+                    if k_core2.startswith(label_core[:3]):
+                        return v
+            return 0.0
+
+        for label, indent, is_total, ftype in INCOME_STATEMENT_ITEMS:
+            row = {'item': label, 'indent': indent, 'is_total': is_total, 'values': []}
+
+            for p in range(num_periods):
+                if p == 0:
+                    # Period 0 = eval date: 取自财务报表实际数
+                    row['values'].append(get_actual_for(label))
+                    continue
+
+                mtd = paa_mtd.get(p, {})
+                val = 0.0
+
+                if ftype == 'paa_revenue':
+                    # Revenue is positive in PAA_MTD → positive in report
+                    val = mtd.get('保险服务收入', 0)
+                elif ftype == 'paa_service_expense':
+                    # PAA_MTD expense is negative → negate to positive in report
+                    val = -mtd.get('保险服务费用', 0)
+                elif ftype == 'paa_ceding_expense':
+                    # PAA_MTD ceding alloc is negative → negate to positive in report
+                    val = -mtd.get('分出保费的分摊', 0)
+                elif ftype == 'paa_recover':
+                    # 减：摊回 is positive in PAA_MTD → positive in report
+                    val = mtd.get('减：摊回保险服务费用', 0)
+                elif ftype == 'paa_financial_loss':
+                    # PAA_MTD IFIE is negative → negate to positive in report
+                    val = -mtd.get('承保财务损失', 0)
+                elif ftype == 'paa_reins_financial':
+                    # 减：分出再保险财务收益 is positive in PAA_MTD → positive in report
+                    val = mtd.get('减：分出再保险财务收益', 0)
+                elif ftype == 'oci':
+                    val = mtd.get('OCI', 0)
+                elif ftype == 'paa_admin_expense':
+                    # PAA_MTD admin expense is negative → negate to positive in report
+                    val = -mtd.get('业务及管理费', 0)
+                elif ftype == 'paa_tax':
+                    # PAA_MTD tax is negative → negate to positive in report
+                    val = -mtd.get('税金及附加', 0)
+                elif ftype == 'interest_income':
+                    val = mtd.get('利息收入', 0)
+                elif ftype == 'investment_income':
+                    val = mtd.get('投资收益', 0)
+                elif ftype == 'other_income':
+                    val = mtd.get('其他收益', 0)
+                elif ftype == 'fair_value_income':
+                    val = mtd.get('公允价值变动收益', 0)
+                elif ftype == 'fx_income':
+                    val = mtd.get('汇兑收益', 0)
+                elif ftype == 'other_business_income':
+                    val = mtd.get('其他业务收入', 0)
+                elif ftype == 'asset_disposal_income':
+                    val = mtd.get('资产处置收益', 0)
+                elif ftype == 'premium_reserve':
+                    # PAA_MTD reserve change is negative (expense) → positive in report
+                    val = -mtd.get('提取保费准备金', 0)
+                elif ftype == 'interest_expense':
+                    # PAA_MTD interest expense is negative → positive in report
+                    val = -mtd.get('利息支出', 0)
+                elif ftype == 'commission_expense':
+                    # PAA_MTD commission expense is negative → positive in report
+                    val = -mtd.get('手续费及佣金支出', 0)
+                elif ftype == 'credit_impairment':
+                    val = -mtd.get('信用减值损失', 0)
+                elif ftype == 'other_asset_impairment':
+                    val = -mtd.get('其他资产减值损失', 0)
+                elif ftype == 'other_business_cost':
+                    val = -mtd.get('其他业务成本', 0)
+                elif ftype == 'non_operating_income':
+                    val = mtd.get('营业外收入', 0)
+                elif ftype == 'non_operating_expense':
+                    # PAA_MTD non-operating expense is negative → positive in report
+                    val = -mtd.get('营业外支出', 0)
+                elif ftype == 'sum_revenue':
+                    # Will be calculated after all items are built
+                    pass
+                elif ftype == 'sum_expense':
+                    pass
+                elif ftype == 'operating_profit':
+                    pass
+                elif ftype == 'total_profit':
+                    pass
+                elif ftype == 'income_tax':
+                    pass
+                elif ftype == 'net_profit':
+                    pass
+                elif ftype == 'comprehensive_income':
+                    pass
+                elif ftype == 'underwriting_profit':
+                    pass
+                # 'zero' and others → 0
+
+                row['values'].append(round(val, 2))
+
+            rows.append(row)
+
+        # Post-process: calculate totals and derived items
+        self._calc_income_statement_totals(rows, num_periods, is_ytd=False)
+
+        return rows
+
+    def _build_mtd_balance_sheet(self, combined_rows: list, forecast_periods: int,
+                                  num_periods: int) -> list:
+        """Build MTD balance sheet rows from combined summary."""
+        # Aggregate liability columns by period and business type
+        period_liabilities = defaultdict(lambda: {'直保或分入': 0.0, '分出': 0.0})
+
+        for row in combined_rows:
+            period = row.get('预测间隔', 1)
+            biz_type = str(row.get('业务类型', ''))
+            if biz_type == '直保或分入':
+                cols = _PAA_DIRECT_LIABILITY_COLS
+            else:
+                cols = _PAA_CEDING_LIABILITY_COLS
+            for col in cols:
+                val = _to_float(row.get(col, 0))
+                if biz_type in period_liabilities[period]:
+                    period_liabilities[period][biz_type] += val
+
+        rows = []
+        for label, indent, is_total, ftype in BALANCE_SHEET_ITEMS:
+            row = {'item': label, 'indent': indent, 'is_total': is_total, 'values': []}
+
+            for p in range(num_periods):
+                if p == 0:
+                    row['values'].append(0.0)
+                    continue
+
+                pl = period_liabilities.get(p, {'直保或分入': 0, '分出': 0})
+                val = 0.0
+
+                if ftype == 'paa_insurance_liability':
+                    val = pl.get('直保或分入', 0)
+                elif ftype == 'paa_reins_asset':
+                    # -SUMIFS for 分出 → negate
+                    val = -pl.get('分出', 0)
+                elif ftype == 'total_assets':
+                    pass  # Will be calculated
+                elif ftype == 'total_liabilities':
+                    pass
+                elif ftype == 'total_eq_liab':
+                    pass
+                # 'header', 'zero' → 0
+
+                row['values'].append(round(val, 2))
+
+            rows.append(row)
+
+        # Calculate totals
+        for p in range(num_periods):
+            if p == 0:
+                continue
+            reins_asset = 0.0
+            ins_liability = 0.0
+            for r in rows:
+                if r['item'] == '分出再保险合同资产':
+                    reins_asset = r['values'][p]
+                elif r['item'] == '保险合同负债':
+                    ins_liability = r['values'][p]
+            for r in rows:
+                if r['item'] == '资产总计':
+                    r['values'][p] = round(reins_asset, 2)
+                elif r['item'] == '负债合计':
+                    r['values'][p] = round(ins_liability, 2)
+                elif r['item'] == '负债及所有者权益总计':
+                    r['values'][p] = round(ins_liability + reins_asset, 2)
+
+        return rows
+
+    def _build_ytd_income_statement(self, mtd_rows: list, dates: list) -> list:
+        """Build YTD income statement from MTD with January reset.
+
+        YTD formula: IF(MONTH(date)=1, 0, prev_YTD) + MTD
+        For derived items (totals, tax, etc.), recalculate from YTD components.
+        """
+        num_periods = len(dates)
+        # Parse dates to get month numbers
+        months = []
+        for d in dates:
+            if isinstance(d, str):
+                try:
+                    parts = d.split('-')
+                    months.append(int(parts[1]))
+                except (IndexError, ValueError):
+                    months.append(1)
+            elif hasattr(d, 'month'):
+                months.append(d.month)
+            else:
+                months.append(1)
+
+        # Build YTD for direct PAA items (cumulative with January reset)
+        ytd_rows = []
+        direct_types = {
+            'paa_revenue', 'paa_service_expense', 'paa_ceding_expense',
+            'paa_recover', 'paa_financial_loss', 'paa_reins_financial', 'oci',
+            'paa_admin_expense', 'paa_tax',
+            # Manual input items
+            'interest_income', 'investment_income', 'other_income',
+            'fair_value_income', 'fx_income', 'other_business_income',
+            'asset_disposal_income',
+            'premium_reserve', 'interest_expense', 'commission_expense',
+            'credit_impairment', 'other_asset_impairment', 'other_business_cost',
+            'non_operating_income', 'non_operating_expense',
+        }
+
+        for mtd_row in mtd_rows:
+            ytd_row = {
+                'item': mtd_row['item'],
+                'indent': mtd_row['indent'],
+                'is_total': mtd_row['is_total'],
+                'values': [],
+            }
+            ftype = None
+            for label, indent, is_total, ft in INCOME_STATEMENT_ITEMS:
+                if label == mtd_row['item']:
+                    ftype = ft
+                    break
+
+            if ftype in direct_types or ftype == 'zero':
+                # YTD = IF(month=1, 0, prev_ytd) + MTD
+                # 第 0 期（评估日）的 YTD 应等于当期 MTD（期初实际数）
+                for p in range(num_periods):
+                    if p == 0:
+                        ytd_row['values'].append(round(mtd_row['values'][p], 2))
+                    elif months[p] == 1:
+                        ytd_row['values'].append(round(mtd_row['values'][p], 2))
+                    else:
+                        prev_ytd = ytd_row['values'][p - 1] if p > 0 else 0
+                        ytd_row['values'].append(round(prev_ytd + mtd_row['values'][p], 2))
+            else:
+                # Totals and derived items - will be calculated in post-process
+                ytd_row['values'] = [0.0] * num_periods
+
+            ytd_rows.append(ytd_row)
+
+        # Post-process: calculate YTD totals and derived items
+        self._calc_income_statement_totals(ytd_rows, num_periods, is_ytd=True)
+
+        # Calculate YTD income tax: YTD = prev_YTD_tax + (current_profit - prev_profit) * 0.25
+        for r in ytd_rows:
+            if r['item'] == '减：所得税费用':
+                for p in range(1, num_periods):
+                    profit_row = next((rr for rr in ytd_rows if rr['item'] == '四、利润总额（亏损总额以"-"号填列）'), None)
+                    if profit_row and p > 0:
+                        if months[p] == 1:
+                            prev_tax = 0
+                        else:
+                            prev_tax = r['values'][p - 1]
+                        curr_profit = profit_row['values'][p]
+                        prev_profit = profit_row['values'][p - 1] if p > 0 else 0
+                        r['values'][p] = round(prev_tax + (curr_profit - prev_profit) * 0.25, 2)
+                break
+
+        # Recalculate net profit and comprehensive income for YTD
+        for r in ytd_rows:
+            if r['item'] == '五、净利润（净亏损以"-"号填列）':
+                profit_row = next((rr for rr in ytd_rows if rr['item'] == '四、利润总额（亏损总额以"-"号填列）'), None)
+                tax_row = next((rr for rr in ytd_rows if rr['item'] == '减：所得税费用'), None)
+                for p in range(num_periods):
+                    r['values'][p] = round(
+                        (profit_row['values'][p] if profit_row else 0) -
+                        (tax_row['values'][p] if tax_row else 0), 2)
+            elif r['item'] == '七、综合收益总额':
+                net_row = next((rr for rr in ytd_rows if rr['item'] == '五、净利润（净亏损以"-"号填列）'), None)
+                oci_row = next((rr for rr in ytd_rows if rr['item'] == '六、其他综合收益的税后净额'), None)
+                for p in range(num_periods):
+                    r['values'][p] = round(
+                        (net_row['values'][p] if net_row else 0) +
+                        (oci_row['values'][p] if oci_row else 0), 2)
+
+        return ytd_rows
+
+    def _calc_income_statement_totals(self, rows: list, num_periods: int, is_ytd: bool):
+        """Calculate total and derived rows in income statement (in-place).
+
+        period 0（评估时点）的总项已从"财务报表实际数"工作表填入，此处只计算承保利润
+        （因为实际数据中没有承保利润行）。
+        """
+        # Build item lookup
+        item_map = {r['item']: r for r in rows}
+
+        for p in range(num_periods):
+            def _v(item_name: str) -> float:
+                return item_map.get(item_name, {}).get('values', [0] * num_periods)[p] if item_name in item_map else 0
+
+            # period 0 总项保留实际数据，仅计算承保利润
+            if p == 0:
+                revenue = _v('保险服务收入')
+                service_expense = _v('保险服务费用')
+                ceding_expense = _v('分出保费的分摊')
+                recover = _v('减：摊回保险服务费用')
+                financial_loss = _v('承保财务损失')
+                reins_financial = _v('减：分出再保险财务收益')
+                premium_reserve = _v('提取保费准备金')
+                if '承保利润' in item_map:
+                    uw_profit = (
+                        revenue - service_expense - ceding_expense + recover -
+                        financial_loss + reins_financial - premium_reserve
+                    )
+                    item_map['承保利润']['values'][p] = round(uw_profit, 2)
+                continue
+
+            # Revenue items (already displayed as positive in report)
+            revenue = _v('保险服务收入')
+            interest_income = _v('利息收入')
+            investment_income = _v('投资收益（损失以"-"号填列）')
+            other_income = _v('其他收益（损失以"-"号填列）')
+            fair_value_income = _v('公允价值变动收益（损失以"-"号填列）')
+            fx_income = _v('汇兑收益（损失以"-"号填列）')
+            other_business_income = _v('其他业务收入')
+            asset_disposal_income = _v('资产处置收益（损失以"-"号填列）')
+
+            # Expense items (already displayed as positive in report)
+            service_expense = _v('保险服务费用')
+            ceding_expense = _v('分出保费的分摊')
+            recover = _v('减：摊回保险服务费用')
+            financial_loss = _v('承保财务损失')
+            reins_financial = _v('减：分出再保险财务收益')
+            premium_reserve = _v('提取保费准备金')
+            interest_expense = _v('利息支出')
+            tax_surcharge = _v('税金及附加')
+            commission_expense = _v('手续费及佣金支出')
+            admin_expense = _v('业务及管理费')
+            credit_impairment = _v('信用减值损失')
+            other_asset_impairment = _v('其他资产减值损失')
+            other_business_cost = _v('其他业务成本')
+
+            # Non-operating items
+            non_operating_income = _v('加：营业外收入')
+            non_operating_expense = _v('减：营业外支出')
+
+            # 一、营业总收入（period 0 取自实际数据，不重新计算）
+            total_revenue = (
+                revenue + interest_income + investment_income + other_income +
+                fair_value_income + fx_income + other_business_income + asset_disposal_income
+            )
+            if '一、营业总收入' in item_map and p > 0:
+                item_map['一、营业总收入']['values'][p] = round(total_revenue, 2)
+
+            # 二、营业总支出 = SUM(expenses) - recover - reins_financial（period 0 取自实际数据）
+            total_expense = (
+                service_expense + ceding_expense + financial_loss + premium_reserve +
+                interest_expense + tax_surcharge + commission_expense + admin_expense +
+                credit_impairment + other_asset_impairment + other_business_cost -
+                recover - reins_financial
+            )
+            if '二、营业总支出' in item_map and p > 0:
+                item_map['二、营业总支出']['values'][p] = round(total_expense, 2)
+
+            # 三、营业利润 = 营业总收入 - 营业总支出（period 0 取自实际数据）
+            operating_profit = total_revenue - total_expense
+            if '三、营业利润（亏损以"-"号填列）' in item_map and p > 0:
+                item_map['三、营业利润（亏损以"-"号填列）']['values'][p] = round(operating_profit, 2)
+
+            # 四、利润总额 = 营业利润 + 营业外收入 - 营业外支出（period 0 取自实际数据）
+            total_profit = operating_profit + non_operating_income - non_operating_expense
+            if '四、利润总额（亏损总额以"-"号填列）' in item_map and p > 0:
+                item_map['四、利润总额（亏损总额以"-"号填列）']['values'][p] = round(total_profit, 2)
+
+            # 减：所得税费用 = 利润总额 × 25%（period 0 取自实际数据，不重新计算）
+            if '减：所得税费用' in item_map and p > 0:
+                item_map['减：所得税费用']['values'][p] = round(total_profit * 0.25, 2)
+
+            # 五、净利润 = 利润总额 - 所得税费用
+            income_tax = _v('减：所得税费用')
+            net_profit = total_profit - income_tax
+            if '五、净利润（净亏损以"-"号填列）' in item_map:
+                item_map['五、净利润（净亏损以"-"号填列）']['values'][p] = round(net_profit, 2)
+
+            # 六、其他综合收益的税后净额 = OCI (already set from paa_mtd)
+            oci_val = _v('六、其他综合收益的税后净额')
+
+            # 七、综合收益总额 = 净利润 + OCI
+            if '七、综合收益总额' in item_map:
+                item_map['七、综合收益总额']['values'][p] = round(net_profit + oci_val, 2)
+
+            # 承保利润 = 保险服务收入 - 保险服务费用 - 分出保费的分摊
+            #            + 摊回保险服务费用 - 承保财务损失 + 分出再保险财务收益 - 提取保费准备金
+            if '承保利润' in item_map:
+                uw_profit = (
+                    revenue - service_expense - ceding_expense + recover -
+                    financial_loss + reins_financial - premium_reserve
+                )
+                item_map['承保利润']['values'][p] = round(uw_profit, 2)
